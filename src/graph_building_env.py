@@ -9,6 +9,7 @@ import networkx as nx
 
 import torch
 import torch_geometric.data as gd
+from src.wl_hash import weisfeiler_lehman_graph_hash
 
 
 class GraphActionType(enum.Enum):
@@ -40,7 +41,7 @@ class GraphAction:
                 if getattr(self, n) is not None
             ]
         )
-        return f"{self.__class__.__name__}(action_type={self.action_type.name}{attr})"
+        return f"{self.__class__.__name__}(action_type={self.action_type.name}, {attr})"
 
 
 class GraphStateType(enum.Enum):
@@ -75,25 +76,22 @@ class GraphState:
     def __repr__(self):
         return f"{self.__class__.__name__}(state_type={self.state_type.name}, num_nodes={len(self.graph)}, num_edges={len(self.graph.edges)})"
 
-    @cached_property
-    def edge_targets(self):
-        if self.edge_source is None:
-            return []
-        return sorted(set(self.frontier) - set(self.graph[self.edge_source]))
+    def is_sane(self):
+        if self.state_type == GraphStateType.EdgeLevel:
+            assert self.edge_source is not None
+            assert self.node_source is not None
+        elif self.state_type == GraphStateType.NodeLevel:
+            assert self.node_source is not None
+        return 1
 
-    def cond_edge_targets(self, cond_state):
-        if self.edge_source is None:
+    def edge_targets(self, cond=None):
+        if self.state_type != GraphStateType.EdgeLevel:
             return set()
-        return set(cond_state.graph[self.edge_source])
-
-    def cond_node_targets(self, cond_state):
-        if self.node_source is None:
-            return []
-        inward_adj = self.graph[self.node_source]
-        outward_adj = cond_state.graph[self.node_source]
-        targets = set(outward_adj) - set(inward_adj)
-        n, e = cond_state.graph.nodes, outward_adj
-        return set([(n[t]["node_type"], e[t]["edge_type"]) for t in targets])
+        t = set(self.frontier) - set(self.graph[self.edge_source])
+        if cond is None:
+            return t
+        else:
+            return t & set(cond.graph[self.edge_source])
 
     @classmethod
     def initial_state(cls):
@@ -129,9 +127,10 @@ class GraphState:
                 state = state.apply_action(action, copy=False)
 
         elif action.action_type == GraphActionType.AddEdge:
+            targets = sorted(state.edge_targets())
             state.graph.add_edge(
                 state.edge_source,
-                state.edge_targets[action.target],
+                targets[action.target],
                 edge_type=action.edge_type,
             )
             state = GraphState(
@@ -141,7 +140,7 @@ class GraphState:
                 edge_source=state.edge_source,
                 frontier=state.frontier,
             )
-            if len(state.edge_targets) == 0:
+            if len(targets) == 0:
                 action = GraphAction(GraphActionType.StopEdge)
                 state = state.apply_action(action, copy=False)
 
@@ -170,7 +169,7 @@ class GraphState:
 
         return state
 
-    def to_tensor_graph(self):
+    def to_tensor_graph(self, cond=None):
         num_nodes = len(self.graph.nodes())
         node_type = torch.tensor(
             [attr["node_type"] for _, attr in self.graph.nodes(data=True)],
@@ -193,7 +192,7 @@ class GraphState:
         ).flatten()
         non_edge_index = (
             torch.tensor(
-                [(self.edge_source, v) for v in self.edge_targets],
+                [(self.edge_source, v) for v in self.edge_targets(cond)],
                 dtype=torch.long,
             )
             .reshape(-1, 2)
@@ -216,6 +215,18 @@ class GraphState:
             non_edge_index=non_edge_index,
             num_nodes=num_nodes,
         )
+
+    def unique_nodes(self, iterations=3):
+        """
+        Unique nodes according to weisfeiler lehman hash.
+        """
+        node_labels = weisfeiler_lehman_graph_hash(
+            self.graph,
+            iterations=iterations,
+            edge_attr="edge_type",
+            node_attr="node_type",
+        )
+        return list({v: k for k, v in node_labels.items()}.values())
 
 
 def graph_bfs_trajectory(G):
@@ -262,7 +273,7 @@ def graph_bfs_trajectory(G):
                     t = edge_targets.pop()  # TODO: backward model
                     if (v, t) in G.edges:
                         target = node_mapping[t]
-                        target_index = state.edge_targets.index(target)
+                        target_index = sorted(state.edge_targets()).index(target)
                         action = GraphAction(
                             GraphActionType.AddEdge,
                             target=target_index,

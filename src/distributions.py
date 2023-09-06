@@ -7,111 +7,169 @@ from torch_scatter import scatter_max, scatter_log_softmax
 from src.graph_building_env import GraphAction, GraphActionType
 
 
-def index_arange(indices):
-    # E.g. indices: [3, 3, 4, 7, 7, 0]
-    #       output: [1, 1, 2, 3, 3, 0]
+def _index_rearange(indices):
+    # input : [3, 3, 4, 7, 7, 0]
+    # output: [1, 1, 2, 3, 3, 0]
     u = indices.unique(sorted=True)
     s = torch.arange(len(u))
-    mapping = torch.full((u.max() + 1,), -1, dtype=torch.long).scatter_(
+    mapping = torch.empty(max(u, default=0) + 1, dtype=torch.long).scatter_(
         dim=0, index=u, src=s
     )
     return mapping[indices]
 
 
-class NullActionCategorical:
-    def __init__(self):
-        self.num_data = 0
+def _index_offset(indices):
+    # input : torch.tensor([0, 0, 0, 1, 2, 2])
+    # output: torch.tensor([0, 3, 4])
+    count = torch.bincount(indices)
+    return torch.cumsum(count, 0) - count
+
+
+def _index_transpose(indices):
+    # input : [1, 2, 3, 0]
+    # output: [3, 0, 1, 2]
+    o = torch.empty_like(indices)
+    s = torch.arange(len(indices))
+    # o[indices] = s : This is bit slower for some reason
+    return o.scatter_(dim=0, index=indices, src=s)
+
+
+def classify_actions_by_state_types(actions):
+    init_actions = [a for a in actions if a.action_type == GraphActionType.Init]
+    nodelv_actions = [
+        a
+        for a in actions
+        if a.action_type in [GraphActionType.AddNode, GraphActionType.StopNode]
+    ]
+    edgelv_actions = [
+        a
+        for a in actions
+        if a.action_type in [GraphActionType.AddEdge, GraphActionType.StopEdge]
+    ]
+    return dict(
+        init_actions=init_actions,
+        nodelv_actions=nodelv_actions,
+        edgelv_actions=edgelv_actions,
+    )
+
+
+class DefaultCategorical(Categorical):
+    def __init__(self, logits):
+        """
+        Set default value when `logits` is empty.
+        """
+        self.logits = logits
+        self._is_empty = len(logits) == 0
+        self.size = len(logits)
+
+        if not self._is_empty:
+            super().__init__(logits=logits)
 
     def sample(self):
-        return []
+        if self._is_empty:
+            return torch.empty_like(self.logits, dtype=torch.long)
+        return super().sample()
 
-    def log_prob(self, actions):
-        return torch.tensor([])
+    def log_prob(self, value):
+        if self._is_empty:
+            return torch.empty_like(self.logits, dtype=torch.float)
+        return super().log_prob(value)
 
 
-class BaseActionCategorical:
-    def __new__(cls, logits, *args, **kargs):
-        if logits.numel() == 0:
-            return NullActionCategorical()
-        else:
-            return super().__new__(cls)
+class FlatCategorical:
+    def __init__(self, logits, indices):
+        assert logits.dtype == torch.float, "`logits` should be torch.float data type"
+        assert indices.dtype == torch.long, "`indices` should be torch.long data type"
+        assert (
+            logits.shape == indices.shape
+        ), f"The shape of `logits` and `indices` should be the same, got logits={logits.shape}, indices={indices.shape}"
+
+        indices = _index_rearange(indices)
+
+        # we don't assume indices are non-decreasing.
+        self.indices, self._si = torch.sort(indices, stable=True)
+        self.logits = logits[self._si]
+        self.size = max(self.indices.tolist(), default=-1) + 1
+
+    def log_prob(self, value):
+        assert self.size == len(value)
+        log_probs = scatter_log_softmax(self.logits, self.indices)
+        return log_probs[value + _index_offset(self.indices)]
+
+    @torch.no_grad()
+    def sample(self):
+        unif = torch.rand_like(self.logits)
+        gumbel = -(-unif.log()).log()
+        _, samples = scatter_max(self.logits + gumbel, self.indices)
+        return samples - _index_offset(self.indices)
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(num_data: {self.num_data})"
+        return f"{self.__class__.__name__}(size={self.size})"
 
 
-class AuxInitActionCategorical(BaseActionCategorical):
-    def __init__(self, logits, indices):
-        self.batch = indices.unique(sorted=True)
-        self.num_data = len(self.batch)
-        self.logits = logits.flatten()
-        self.indices = index_arange(indices)
-
-    def sample(self):
-        u = torch.rand_like(self.logits)
-        gumbel = -(-u.log()).log()
-        _, samples = scatter_max(self.logits + gumbel, self.indices)
-        actions = []
-        for i in samples.tolist():
-            a = GraphAction(GraphActionType.Init, target=i)
-            actions.append(a)
-        return actions
-
-    def log_prob(self, actions):
-        targets = torch.LongTensor([a.target for a in actions])
-        log_probs = scatter_log_softmax(self.logits, self.indices)
-        return log_probs[self.batch + targets]
-
-
-class InitActionCategorical(BaseActionCategorical):
-    def __init__(self, logits):
-        self.num_data = len(logits)
-        self.logits = logits
-        self.cat = Categorical(logits=logits)
-
-    @torch.no_grad()
-    def sample(self):
-        samples = self.cat.sample()
-        actions = [
-            GraphAction(GraphActionType.Init, node_type=i) for i in samples.tolist()
-        ]
-        return actions
-
-    def log_prob(self, actions):
-        index = torch.LongTensor([a.node_type for a in actions])
-        return self.cat.log_prob(index)
-
-
-class NodeLevelActionCategorical(BaseActionCategorical):
-    def __init__(self, logits, num_edge_types):
-        self.num_data = len(logits)
-        self.logits = logits
+class ActionCategorical:
+    def __init__(
+        self,
+        init_logits,
+        nodelv_logits,
+        edgelv_logits,
+        edgelv_indices,
+        logits_locations,
+        num_edge_types,
+        init_indices=None,  # this is for aux forward
+    ):
+        self.init_logits = init_logits
+        self.nodelv_logits = nodelv_logits
+        self.edgelv_logits = edgelv_logits
+        self.ordering_indices = _index_transpose(logits_locations)
         self.num_edge_types = num_edge_types
-        self.cat = Categorical(logits=logits)
 
-    @torch.no_grad()
-    def sample(self):
-        samples = self.cat.sample()
-        actions = []
-        for i in samples.tolist():
-            # stop, nodetype=0, nodetype=0, nodetype=1, nodetype=1, ...
-            #     , edgetype=0, edgetype=1, edgetype=0, edgetype=1, ...
-            if i == 0:
-                a = GraphAction(GraphActionType.StopNode)
-            else:
-                node_type = (i - 1) // self.num_edge_types
-                edge_type = (i - 1) % self.num_edge_types
-                a = GraphAction(
-                    GraphActionType.AddNode,
-                    node_type=node_type,
-                    edge_type=edge_type,
-                )
+        if init_indices is None:
+            self.init_cat = DefaultCategorical(logits=init_logits)
+        else:
+            self.init_cat = FlatCategorical(logits=init_logits, indices=init_indices)
 
-            actions.append(a)
-        return actions
+        self.nodelv_cat = DefaultCategorical(logits=nodelv_logits)
+        self.edgelv_cat = FlatCategorical(logits=edgelv_logits, indices=edgelv_indices)
+
+        self.sizes = (self.init_cat.size, len(nodelv_logits), self.edgelv_cat.size)
 
     def log_prob(self, actions):
-        index = torch.LongTensor(
+        table = classify_actions_by_state_types(actions)
+        init_log_prob = self.init_logprob(table["init_actions"])
+        node_log_prob = self.nodelv_logprob(table["nodelv_actions"])
+        edge_log_prob = self.edgelv_logprob(table["edgelv_actions"])
+        log_probs = torch.cat([init_log_prob, node_log_prob, edge_log_prob], 0)
+        return log_probs[self.ordering_indices]
+
+    def sample(self):
+        samples = (
+            self.init_tensor_to_actions(self.init_cat.sample())
+            + self.nodelv_tensor_to_actions(self.nodelv_cat.sample())
+            + self.edgelv_tensor_to_actions(self.edgelv_cat.sample())
+        )
+        return [samples[i.item()] for i in self.ordering_indices]
+
+    def init_logprob(self, actions):
+        value = self.init_actions_to_tensor(actions)
+        return self.init_cat.log_prob(value)
+
+    def nodelv_logprob(self, actions):
+        value = self.nodelv_actions_to_tensor(actions)
+        return self.nodelv_cat.log_prob(value)
+
+    def edgelv_logprob(self, actions):
+        value = self.edgelv_actions_to_tensor(actions)
+        return self.edgelv_cat.log_prob(value)
+
+    def init_actions_to_tensor(self, actions):
+        return torch.LongTensor([a.node_type for a in actions])
+
+    def init_tensor_to_actions(self, tensor):
+        return [GraphAction(GraphActionType.Init, node_type=i.item()) for i in tensor]
+
+    def nodelv_actions_to_tensor(self, actions):
+        return torch.LongTensor(
             [
                 0
                 if a.action_type == GraphActionType.StopNode
@@ -119,49 +177,26 @@ class NodeLevelActionCategorical(BaseActionCategorical):
                 for a in actions
             ]
         )
-        return self.cat.log_prob(index)
 
-
-class EdgeLevelActionCategorical(BaseActionCategorical):
-    def __init__(
-        self, stop_logits, edge_logits, stop_edge_batch, non_edge_batch, num_edge_types
-    ):
-        self.num_data = len(stop_logits)
-        self.num_edge_types = num_edge_types
-        self.logits = torch.cat([stop_logits.flatten(), edge_logits.flatten()], 0)
-
-        # We don't assume batch index starts from 0 and increases linearly.
-        # E.g. indices: [3, 3, 4, 7, 7] -> self.batch: [0, 0, 1, 2, 2]
-        non_edge_batch = non_edge_batch.repeat_interleave(num_edge_types)
-        indices = torch.cat([stop_edge_batch, non_edge_batch], 0)
-        self.batch = index_arange(indices)
-
-    @torch.no_grad()
-    def sample(self):
-        u = torch.rand_like(self.logits)
-        gumbel = -(-u.log()).log()
-        _, samples = scatter_max(self.logits + gumbel, self.batch)
-        # samples = samples[samples != len(self.logits)]
+    def nodelv_tensor_to_actions(self, tensor):
+        # stop, nodetype=0, nodetype=0, nodetype=1, nodetype=1, ...
+        #     , edgetype=0, edgetype=1, edgetype=0, edgetype=1, ...
         actions = []
-        for i in samples.tolist():
-            # stop,   target=0,   target=0,   target=1,   target=1, ...
-            #     , edgetype=0, edgetype=1, edgetype=0, edgetype=1, ...
+        for i in tensor:
+            i = i.item()
             if i == 0:
-                a = GraphAction(GraphActionType.StopEdge)
+                a = GraphAction(GraphActionType.StopNode)
             else:
-                target = (i - 1) // self.num_edge_types
-                edge_type = (i - 1) % self.num_edge_types
                 a = GraphAction(
-                    GraphActionType.AddEdge,
-                    target=target,
-                    edge_type=edge_type,
+                    GraphActionType.AddNode,
+                    node_type=(i - 1) // self.num_edge_types,
+                    edge_type=(i - 1) % self.num_edge_types,
                 )
             actions.append(a)
         return actions
 
-    def log_prob(self, actions):
-        assert self.num_data == len(actions)
-        edge_index = torch.LongTensor(
+    def edgelv_actions_to_tensor(self, actions):
+        return torch.LongTensor(
             [
                 0
                 if a.action_type == GraphActionType.StopEdge
@@ -169,51 +204,39 @@ class EdgeLevelActionCategorical(BaseActionCategorical):
                 for a in actions
             ]
         )
-        log_probs = scatter_log_softmax(self.logits, self.batch)
-        mask = edge_index == 0
-        edge_index[mask] = torch.arange(self.num_data)[mask]
-        if self.num_data != len(
-            self.logits
-        ):  # only stop actions are available when self.num_data == len(self.logits)
-            cnt = torch.bincount(self.batch[self.num_data :], minlength=self.num_data)
-            ptr = torch.cumsum(cnt, dim=0) - cnt + self.num_data
-            edge_index[~mask] = edge_index[~mask] + ptr[~mask] - 1
-        return log_probs[edge_index]
 
-
-class GraphActionCategorical:
-    def __init__(self, init_cat, node_cat, edge_cat, order):
-        self.init_cat = init_cat
-        self.node_cat = node_cat
-        self.edge_cat = edge_cat
-        self.order = order
-
-    def sample(self):
-        samples = (
-            self.init_cat.sample() + self.node_cat.sample() + self.edge_cat.sample()
-        )
-        return np.array(samples)[self.order.tolist()].tolist()
-
-    def log_prob(self, actions):
-        init_actions = [a for a in actions if a.action_type == GraphActionType.Init]
-        node_actions = [
-            a
-            for a in actions
-            if a.action_type in [GraphActionType.AddNode, GraphActionType.StopNode]
-        ]
-        edge_actions = [
-            a
-            for a in actions
-            if a.action_type in [GraphActionType.AddEdge, GraphActionType.StopEdge]
-        ]
-        init_log_prob = self.init_cat.log_prob(init_actions)
-        node_log_prob = self.node_cat.log_prob(node_actions)
-        edge_log_prob = self.edge_cat.log_prob(edge_actions)
-        log_probs = torch.cat([init_log_prob, node_log_prob, edge_log_prob], 0)
-        return log_probs[self.order]
+    def edgelv_tensor_to_actions(self, tensor):
+        # stop,   target=0,   target=0,   target=1,   target=1, ...
+        #     , edgetype=0, edgetype=1, edgetype=0, edgetype=1, ...
+        actions = []
+        for i in tensor:
+            i = i.item()
+            if i == 0:
+                a = GraphAction(GraphActionType.StopEdge)
+            else:
+                a = GraphAction(
+                    GraphActionType.AddEdge,
+                    target=(i - 1) // self.num_edge_types,
+                    edge_type=(i - 1) % self.num_edge_types,
+                )
+            actions.append(a)
+        return actions
 
     def __repr__(self):
-        attr = ", ".join(
-            [str(cat.num_data) for cat in [self.init_cat, self.node_cat, self.edge_cat]]
-        )
-        return f"{self.__class__.__name__}(num_data: {attr})"
+        return f"{self.__class__.__name__}(sizes: {self.sizes})"
+
+
+from unittest import TestCase
+
+
+class Test(TestCase):
+    def test_flatcat_log_prob(self):
+        logits = torch.tensor([1, 1, 1, 1, 1, 1]).float()
+        indices = torch.tensor([0, 0, 1, 0, 1, 2])
+        value = torch.tensor([1, 1, 0])
+
+        log_probs = scatter_log_softmax(logits, indices)
+        log_probs_ = FlatCategorical(logits, indices).log_prob(value)
+
+        value = all(log_probs[[1, -2, -1]] == log_probs_)
+        self.assertTrue(value)
