@@ -4,34 +4,8 @@ import torch
 from torch.distributions import Categorical
 from torch_scatter import scatter_max, scatter_log_softmax
 
-from src.graph_building_env import GraphAction, GraphActionType
-
-
-def _index_rearange(indices):
-    # input : [3, 3, 4, 7, 7, 0]
-    # output: [1, 1, 2, 3, 3, 0]
-    u = indices.unique(sorted=True)
-    s = torch.arange(len(u))
-    mapping = torch.empty(max(u, default=0) + 1, dtype=torch.long).scatter_(
-        dim=0, index=u, src=s
-    )
-    return mapping[indices]
-
-
-def _index_offset(indices):
-    # input : torch.tensor([0, 0, 0, 1, 2, 2])
-    # output: torch.tensor([0, 3, 4])
-    count = torch.bincount(indices)
-    return torch.cumsum(count, 0) - count
-
-
-def _index_transpose(indices):
-    # input : [1, 2, 3, 0]
-    # output: [3, 0, 1, 2]
-    o = torch.empty_like(indices)
-    s = torch.arange(len(indices))
-    # o[indices] = s : This is bit slower for some reason
-    return o.scatter_(dim=0, index=indices, src=s)
+from src.containers import GraphAction, GraphActionType
+import src.index_utils as index_utils
 
 
 def classify_actions_by_state_types(actions):
@@ -67,12 +41,12 @@ class DefaultCategorical(Categorical):
 
     def sample(self):
         if self._is_empty:
-            return torch.empty_like(self.logits, dtype=torch.long)
+            return torch.empty_like(self.logits, dtype=torch.long).flatten()
         return super().sample()
 
     def log_prob(self, value):
         if self._is_empty:
-            return torch.empty_like(self.logits, dtype=torch.float)
+            return torch.empty_like(self.logits, dtype=torch.float).flatten()
         return super().log_prob(value)
 
 
@@ -84,7 +58,7 @@ class FlatCategorical:
             logits.shape == indices.shape
         ), f"The shape of `logits` and `indices` should be the same, got logits={logits.shape}, indices={indices.shape}"
 
-        indices = _index_rearange(indices)
+        indices = index_utils.rearange(indices)[indices]
 
         # we don't assume indices are non-decreasing.
         self.indices, self._si = torch.sort(indices, stable=True)
@@ -92,16 +66,18 @@ class FlatCategorical:
         self.size = max(self.indices.tolist(), default=-1) + 1
 
     def log_prob(self, value):
-        assert self.size == len(value)
+        assert self.size == len(
+            value
+        ), f"size doesn't match, size {self.size}, got {value.shape}"
         log_probs = scatter_log_softmax(self.logits, self.indices)
-        return log_probs[value + _index_offset(self.indices)]
+        return log_probs[value + index_utils.compute_offset(self.indices)]
 
     @torch.no_grad()
     def sample(self):
         unif = torch.rand_like(self.logits)
         gumbel = -(-unif.log()).log()
         _, samples = scatter_max(self.logits + gumbel, self.indices)
-        return samples - _index_offset(self.indices)
+        return samples - index_utils.compute_offset(self.indices)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(size={self.size})"
@@ -116,18 +92,22 @@ class ActionCategorical:
         edgelv_indices,
         logits_locations,
         num_edge_types,
-        init_indices=None,  # this is for aux forward
+        cond_info=None,
     ):
         self.init_logits = init_logits
         self.nodelv_logits = nodelv_logits
         self.edgelv_logits = edgelv_logits
-        self.ordering_indices = _index_transpose(logits_locations)
+        self.ordering_indices = index_utils.transpose(logits_locations)
         self.num_edge_types = num_edge_types
 
-        if init_indices is None:
+        self.cond_info = cond_info
+
+        if cond_info is None:
             self.init_cat = DefaultCategorical(logits=init_logits)
         else:
-            self.init_cat = FlatCategorical(logits=init_logits, indices=init_indices)
+            self.init_cat = FlatCategorical(
+                logits=init_logits, indices=cond_info["init_indices"]
+            )
 
         self.nodelv_cat = DefaultCategorical(logits=nodelv_logits)
         self.edgelv_cat = FlatCategorical(logits=edgelv_logits, indices=edgelv_indices)
@@ -163,10 +143,27 @@ class ActionCategorical:
         return self.edgelv_cat.log_prob(value)
 
     def init_actions_to_tensor(self, actions):
-        return torch.LongTensor([a.node_type for a in actions])
+        if self.cond_info is None:
+            return torch.LongTensor([a.node_type for a in actions])
+        else:
+            return torch.LongTensor([a.target for a in actions])
 
     def init_tensor_to_actions(self, tensor):
-        return [GraphAction(GraphActionType.Init, node_type=i.item()) for i in tensor]
+        if self.cond_info is None:
+            return [
+                GraphAction(GraphActionType.Init, node_type=i.item(), target=0)
+                for i in tensor
+            ]
+        else:
+            return [
+                GraphAction(
+                    GraphActionType.Init,
+                    node_type=self.cond_info["node_types"][i].item(),
+                    target=i.item(),
+                    node_label=self.cond_info["node_labels"][i].item(),  # TODO
+                )
+                for i in tensor
+            ]
 
     def nodelv_actions_to_tensor(self, actions):
         return torch.LongTensor(
@@ -226,17 +223,17 @@ class ActionCategorical:
         return f"{self.__class__.__name__}(sizes: {self.sizes})"
 
 
-from unittest import TestCase
+if __name__ == "__main__":
+    from unittest import TestCase
 
+    class Test(TestCase):
+        def test_flatcat_log_prob(self):
+            logits = torch.tensor([1, 1, 1, 1, 1, 1]).float()
+            indices = torch.tensor([0, 0, 1, 0, 1, 2])
+            value = torch.tensor([1, 1, 0])
 
-class Test(TestCase):
-    def test_flatcat_log_prob(self):
-        logits = torch.tensor([1, 1, 1, 1, 1, 1]).float()
-        indices = torch.tensor([0, 0, 1, 0, 1, 2])
-        value = torch.tensor([1, 1, 0])
+            log_probs = scatter_log_softmax(logits, indices)
+            log_probs_ = FlatCategorical(logits, indices).log_prob(value)
 
-        log_probs = scatter_log_softmax(logits, indices)
-        log_probs_ = FlatCategorical(logits, indices).log_prob(value)
-
-        value = all(log_probs[[1, -2, -1]] == log_probs_)
-        self.assertTrue(value)
+            value = all(log_probs[[1, -2, -1]] == log_probs_)
+            self.assertTrue(value)
