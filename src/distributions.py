@@ -9,7 +9,7 @@ import src.index_utils as index_utils
 
 
 def classify_actions_by_state_types(actions):
-    init_actions = [a for a in actions if a.action_type == GraphActionType.Init]
+    init_actions = [a for a in actions if a.action_type == GraphActionType.First]
     nodelv_actions = [
         a
         for a in actions
@@ -50,7 +50,7 @@ class DefaultCategorical(Categorical):
         return super().log_prob(value)
 
 
-class FlatCategorical:
+class RaggedCategorical:
     def __init__(self, logits, indices):
         assert logits.dtype == torch.float, "`logits` should be torch.float data type"
         assert indices.dtype == torch.long, "`indices` should be torch.long data type"
@@ -144,12 +144,12 @@ class ActionCategorical:
     def init_tensor_to_actions(self, tensor):
         if self._cond_info is None:
             return [
-                GraphAction(GraphActionType.Init, node_type=i.item()) for i in tensor
+                GraphAction(GraphActionType.First, node_type=i.item()) for i in tensor
             ]
         else:
             return [
                 GraphAction(
-                    GraphActionType.Init,
+                    GraphActionType.First,
                     node_type=self._cond_info["node_types"][i].item(),
                     target=i.item(),
                     node_label=self._cond_info["node_labels"][i].item(),  # TODO
@@ -273,7 +273,7 @@ class CondActionCategorical:
         # TODO: self.init_node_types
         return [
             GraphAction(
-                GraphActionType.Init,
+                GraphActionType.First,
                 node_type=nt[i.item()],
                 node_label=i.item(),
             )
@@ -344,7 +344,7 @@ if __name__ == "__main__":
             value = torch.tensor([1, 1, 0])
 
             log_probs = scatter_log_softmax(logits, indices)
-            log_probs_ = FlatCategorical(logits, indices).log_prob(value)
+            log_probs_ = RaggedCategorical(logits, indices).log_prob(value)
 
             value = all(log_probs[[1, -2, -1]] == log_probs_)
             self.assertTrue(value)

@@ -10,7 +10,7 @@ from src.wl_hash import weisfeiler_lehman_graph_hash
 
 
 class GraphActionType(enum.Enum):
-    Init = enum.auto()
+    First = enum.auto()
     AddNode = enum.auto()
     AddEdge = enum.auto()
     StopEdge = enum.auto()
@@ -34,10 +34,10 @@ class NodeStateType(enum.Enum):
 @dataclass
 class GraphAction:
     action_type: GraphActionType
-    target: int = None  # AddEdge, Init(B), AddNode(B)
-    node_type: int = None  # Init(F), AddNode(F, B)
-    edge_type: int = None  # AddEdge, AddNode(F, B)
-    node_label: int = None  # Init, AddNode
+    target: Optional[int] = None  # AddEdge, First(B), AddNode(B)
+    node_type: Optional[int] = None  # Init(F), AddNode(F, B)
+    edge_type: Optional[int] = None  # AddEdge, AddNode(F, B)
+    node_label: Optional[int] = None  # First, AddNode
 
     def __repr__(self):
         attr = ", ".join(
@@ -58,31 +58,26 @@ class GraphState:
     graph: nx.Graph
     node_source: Optional[int] = None  # EdgeLevel, NodeLevel
     edge_source: Optional[int] = None  # EdgeLevel
-    frontier: deque[int] = field(default_factory=deque)
-    node_hashes: dict = None
+    queue: deque[int] = field(default_factory=deque)
+
+    _node_hashes: Optional[dict] = None
+    _q_index: int = 0
 
     def is_sane(self):
         if self.state_type == GraphStateType.EdgeLevel:
             assert self.edge_source is not None
             assert self.node_source is not None
-            assert self.edge_source not in self.frontier
-            assert self.node_source not in self.frontier
+            assert self.edge_source not in self.queue
+            assert self.node_source not in self.queue
         elif self.state_type == GraphStateType.NodeLevel:
             assert self.node_source is not None
         return True
 
-    @property
     def edge_targets(self):
-        """
-        Returns a list of nodes that is not connected to `edge_source`, i.e., edge-level targets.
-        """
-        if self.state_type != GraphStateType.EdgeLevel:
-            return []
-        connected = set(self.graph[self.edge_source])
-        return [i for i in self.frontier if i not in connected]
+        return list(self.queue)[self._q_index :]
 
     def hash_nodes(self, iterations=4):
-        self.node_hashes = weisfeiler_lehman_graph_hash(
+        self._node_hashes = weisfeiler_lehman_graph_hash(
             self.graph,
             iterations=iterations,
             edge_attr="edge_type",
@@ -93,7 +88,7 @@ class GraphState:
         self.state_type = GraphStateType.Terminal
         self.node_source = None
         self.edge_source = None
-        self.frontier = deque()
+        self.queue = deque()
 
     def __repr__(self):
         attr = ", ".join(
@@ -103,8 +98,8 @@ class GraphState:
                 if getattr(self, n) is not None
             ]
         )
-        if self.frontier:
-            attr = attr + f", frontier: {self.frontier}"
+        if self.queue:
+            attr = attr + f", queue: {self.queue}"
         if attr:
             attr = ", " + attr
         return f"{self.__class__.__name__}(state_type: {self.state_type.name}, num_nodes: {len(self.graph)}, num_edges: {len(self.graph.edges)}{attr})"
@@ -117,7 +112,7 @@ class Trajectory:
 
     def add(self, state, action):
         self.states.append(state)
-        self.action.append(action)
+        self.actions.append(action)
 
     @property
     def last_state(self):
@@ -143,7 +138,7 @@ class Trajectory:
         for i in range(len(actions)):
             s, s_, a = states[i], states[i + 1], actions[i]
 
-            if a.action_type == GraphActionType.Init:
+            if a.action_type == GraphActionType.First:
                 assert s.state_type == GraphStateType.Initial
             elif a.action_type in [GraphActionType.AddNode, GraphActionType.StopNode]:
                 assert s.state_type == GraphStateType.NodeLevel

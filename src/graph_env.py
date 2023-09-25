@@ -82,7 +82,7 @@ class GraphEnv:
         else:
             state = state
 
-        if action.action_type == GraphActionType.Init:
+        if action.action_type == GraphActionType.First:
             node_label = (
                 action.node_label if action.node_label is not None else len(state.graph)
             )
@@ -106,51 +106,55 @@ class GraphEnv:
                 graph=state.graph,
                 node_source=state.node_source,
                 edge_source=node_label,
-                frontier=state.frontier,
+                queue=state.queue,
             )
-            if len(state.frontier) == 0:
+            if len(state.queue) == 0:
                 action = GraphAction(GraphActionType.StopEdge)
                 state = self.step(state, action, copy=False)
 
         elif action.action_type == GraphActionType.AddEdge:
             assert action.edge_type is not None
             assert action.target is not None
-            targets = state.edge_targets
+            targets = state.edge_targets()
             state.graph.add_edge(
                 state.edge_source,
                 targets[action.target],
                 edge_type=action.edge_type,
             )
+            q_index = state._q_index + action.target + 1
             state = GraphState(
                 GraphStateType.EdgeLevel,
                 graph=state.graph,
                 node_source=state.node_source,
                 edge_source=state.edge_source,
-                frontier=state.frontier,
+                queue=state.queue,
+                _q_index=q_index,
             )
-            if len(state.edge_targets) == 0:
+            if len(state.queue) == q_index:
                 action = GraphAction(GraphActionType.StopEdge)
                 state = self.step(state, action, copy=False)
 
         elif action.action_type == GraphActionType.StopEdge:
-            state.frontier.append(state.edge_source)
+            state.queue.append(state.edge_source)
             state = GraphState(
                 GraphStateType.NodeLevel,
                 graph=state.graph,
                 node_source=state.node_source,
                 edge_source=None,
-                frontier=state.frontier,
+                queue=state.queue,
+                _q_index=len(state.queue),
             )
 
         elif action.action_type == GraphActionType.StopNode:
-            if len(state.frontier) > 0:
-                node_source = state.frontier.popleft()
+            if len(state.queue) > 0:
+                node_source = state.queue.popleft()
                 state = GraphState(
                     GraphStateType.NodeLevel,
                     graph=state.graph,
                     node_source=node_source,
                     edge_source=None,
-                    frontier=state.frontier,
+                    queue=state.queue,
+                    _q_index=len(state.queue),
                 )
             else:
                 state = GraphState(GraphStateType.Terminal, graph=state.graph)
@@ -162,12 +166,12 @@ class GraphEnv:
         init = random.randint(0, num_nodes - 1)  # TODO: backward model
         node_mapping = [-1] * num_nodes
         node_mapping[init] = 0
-        frontier = deque([init])
+        queue = deque([init])
 
         state = self.initial_state()
 
         action = GraphAction(
-            GraphActionType.Init,
+            GraphActionType.First,
             node_type=graph.nodes[init]["node_type"],
             node_label=0 if new_index else init,
         )
@@ -182,7 +186,7 @@ class GraphEnv:
 
         while state.state_type != GraphStateType.Terminal:  # Loop: StopNode
             # u: node_source
-            u = frontier.popleft()
+            u = queue.popleft()
             u_neighbors = list(graph[u])
             random.shuffle(u_neighbors)
             while u_neighbors:  # Loop: AddNode
@@ -191,7 +195,7 @@ class GraphEnv:
 
                 if node_mapping[v] == -1:
                     node_mapping[v] = len(state.graph)
-                    frontier.append(v)
+                    queue.append(v)
                     action = GraphAction(
                         GraphActionType.AddNode,
                         node_type=graph.nodes[v]["node_type"],
@@ -200,12 +204,11 @@ class GraphEnv:
                     )
                     state = next_state(state, action)
 
-                    edge_targets = list(set(frontier) - set([u, v]))
-                    while edge_targets:  # Loop: AddEdge
-                        t = edge_targets.pop()  # TODO: backward model
+                    targets = [q for q in queue if q != u and q != v]
+                    for t in targets:  # Loop: AddEdge
                         if (v, t) in graph.edges:
                             target_node = node_mapping[t] if new_index else t
-                            target_index = state.edge_targets.index(target_node)
+                            target_index = state.edge_targets().index(target_node)
 
                             action = GraphAction(
                                 GraphActionType.AddEdge,
@@ -254,7 +257,7 @@ class GraphEnv:
         ).flatten()
         non_edge_index = (
             torch.tensor(
-                [(state.edge_source, v) for v in state.edge_targets],
+                [(state.edge_source, v) for v in state.edge_targets()],
                 dtype=torch.long,
             )
             .reshape(-1, 2)
@@ -268,17 +271,17 @@ class GraphEnv:
         non_edge_index = mapping[non_edge_index]
 
         node_state_type = torch.zeros(num_nodes, dtype=torch.long)
-        frontier_order = torch.full((num_nodes,), -1, dtype=torch.long)
+        queue_order = torch.full((num_nodes,), -1, dtype=torch.long)
         if state.node_source is not None:
             node_source = mapping[state.node_source] if len(mapping) > 1 else 0
             node_state_type[node_source] = NodeStateType.NodeSource.value - 1
         if state.edge_source is not None:
             edge_source = mapping[state.edge_source]
             node_state_type[edge_source] = NodeStateType.EdgeSource.value - 1
-        if state.frontier:
-            frontier = mapping[state.frontier]
-            node_state_type[frontier] = NodeStateType.Frontier.value - 1
-            frontier_order[frontier] = torch.arange(len(frontier))
+        if state.queue:
+            queue = mapping[state.queue]
+            node_state_type[queue] = NodeStateType.Frontier.value - 1
+            queue_order[queue] = torch.arange(len(queue))
 
         return gd.Data(
             node_type=node_type,
@@ -288,7 +291,7 @@ class GraphEnv:
             non_edge_index=non_edge_index,
             num_non_edges=non_edge_index.shape[1],
             state_type=state.state_type.value,
-            frontier_order=frontier_order,
+            queue_order=queue_order,
             node_mapping=node_mapping,
             node_label=node_label,
         )

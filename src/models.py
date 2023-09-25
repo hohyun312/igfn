@@ -7,7 +7,7 @@ import torch_geometric.nn as gnn
 import torch_geometric.data as gd
 
 import src.index_utils as index_utils
-from src.distributions import ActionCategorical, DefaultCategorical, FlatCategorical
+from src.distributions import ActionCategorical, DefaultCategorical, RaggedCategorical
 from src.graph_env import GraphEnv
 from src.containers import GraphState, SortedStates
 
@@ -128,7 +128,7 @@ class GraphPolicy(nn.Module):
         self.logZ = nn.Parameter(torch.tensor(1.0, dtype=torch.float))
         self.emb = nn.ModuleDict(
             {
-                "frontier_order": PositionalEncoding(emb_dim),
+                "queue_order": PositionalEncoding(emb_dim),
                 "node_type": nn.Embedding(env.num_node_types + 1, emb_dim),
                 "edge_type": nn.Embedding(env.num_edge_types, emb_dim),
                 "node_state_type": nn.Embedding(4, emb_dim),
@@ -159,7 +159,7 @@ class GraphPolicy(nn.Module):
         g.x = (
             self.emb["node_type"](g.node_type)
             + self.emb["node_state_type"](g.node_state_type)
-            + self.emb["frontier_order"](g.frontier_order)
+            + self.emb["queue_order"](g.queue_order)
         )
         g.edge_attr = self.emb["edge_type"](g.edge_type)
         g.cond = self.emb["virtual_node"](
@@ -193,7 +193,7 @@ class GraphPolicy(nn.Module):
 
         init_cat = DefaultCategorical(logits=init_logits)
         nodelv_cat = DefaultCategorical(logits=nodelv_logits)
-        edgelv_cat = FlatCategorical(logits=edgelv_logits, indices=edgelv_index)
+        edgelv_cat = RaggedCategorical(logits=edgelv_logits, indices=edgelv_index)
 
         return ActionCategorical(
             init_cat,
@@ -331,7 +331,7 @@ class GraphPolicy(nn.Module):
         stop_mask = torch.ones(len(g.edgelv_index), dtype=torch.bool)
         for i, k in enumerate(g.edgelv_index):
             state, cond = states[k.item()], cond_states[k.item()]
-            tgt = state.edge_targets
+            tgt = state.edge_targets()
             cond_edges = set(cond.graph[state.edge_source])
             valid_targets = [(i, t) for i, t in enumerate(tgt) if t in cond_edges]
 
