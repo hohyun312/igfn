@@ -7,9 +7,9 @@ import torch_geometric.nn as gnn
 import torch_geometric.data as gd
 
 import src.index_utils as index_utils
-from src.distributions import ActionCategorical
+from src.distributions import ActionCategorical, DefaultCategorical, FlatCategorical
 from src.graph_env import GraphEnv
-from src.containers import GraphState
+from src.containers import GraphState, SortedStates
 
 
 def mlp(n_in, n_hid, n_out, n_layer=1, act=nn.LeakyReLU):
@@ -29,15 +29,22 @@ class PositionalEncoding(gnn.PositionalEncoding):
         return output
 
 
-class GraphModel(nn.Module):
-    def __init__(
-        self, env: GraphEnv, emb_dim: int = 64, num_layers: int = 3, num_heads: int = 2
-    ):
+class TwoHeadMLP(nn.Module):
+    def __init__(self, head1_param, head2_param):
         super().__init__()
-        self.env = env
-        self.num_layers = num_layers
+        self.head1 = mlp(*head1_param)
+        self.head2 = mlp(*head2_param)
 
-        self.logZ = nn.Parameter(torch.tensor(1.0, dtype=torch.float))
+    def forward(self, x1, x2):
+        logit1 = self.head1(x1).flatten()
+        logit2 = self.head2(x2).flatten()
+        return torch.cat([logit1, logit2], 0)
+
+
+class GraphTransformer(nn.Module):
+    def __init__(self, emb_dim: int = 64, num_layers: int = 3, num_heads: int = 2):
+        super().__init__()
+        self.num_layers = num_layers
         self.graph2emb = nn.ModuleList(
             sum(
                 [
@@ -58,135 +65,9 @@ class GraphModel(nn.Module):
                 [],
             )
         )
-        self.emb = nn.ModuleDict(
-            {
-                "frontier_order": PositionalEncoding(emb_dim),
-                "node_type": nn.Embedding(env.num_node_types + 1, emb_dim),
-                "edge_type": nn.Embedding(env.num_edge_types, emb_dim),
-                "node_state_type": nn.Embedding(4, emb_dim),
-                "virtual_node": nn.Embedding(1, emb_dim),
-            }
-        )
-        self.mlp = nn.ModuleDict(
-            {
-                "init": mlp(emb_dim, emb_dim, env.num_node_types),
-                "nodelv": mlp(
-                    emb_dim, emb_dim, env.num_edge_types * env.num_node_types + 1
-                ),
-                "edgelv_tgt": mlp(emb_dim, emb_dim, env.num_edge_types),
-                "edgelv_stop": mlp(emb_dim, emb_dim, 1),
-            }
-        )
-        self.cond_mlp = nn.ModuleDict(
-            {
-                "init": mlp(emb_dim, emb_dim, 1),
-                "nodelv": mlp(
-                    emb_dim, emb_dim, env.num_edge_types * env.num_node_types + 1
-                ),
-                "edgelv": mlp(emb_dim, emb_dim, env.num_edge_types),
-            }
-        )
 
-    def forward(self, states: List[GraphState]):
-        g = self.env.collate(states)
-
-        assert len(g.terminal_index) == 0, "Terminal state may cause errors"
-
-        embeddings = self.embed(g)
-
-        glob = embeddings["graph_embeddings"]
-        ne_emb = embeddings["non_edge_embeddings"]
-
-        init_logits = self.mlp["init"](glob[g.is_init])
-        nodelv_logits = self.mlp["nodelv"](glob[g.is_nodelv])
-        edge_target_logits = self.mlp["edgelv_tgt"](ne_emb)
-        edge_stop_logits = self.mlp["edgelv_stop"](glob[g.is_edgelv])
-
-        edgelv_logits = torch.cat(
-            [edge_stop_logits.flatten(), edge_target_logits.flatten()], 0
-        )
-        edge_target_indices = torch.arange(g.num_graphs).repeat_interleave(
-            g.num_non_edges * self.env.num_edge_types
-        )
-        edgelv_indices = torch.cat([g.edgelv_index, edge_target_indices])
-
-        locations = torch.cat([g.init_index, g.nodelv_index, g.edgelv_index])
-
-        return ActionCategorical(
-            init_logits,
-            nodelv_logits,
-            edgelv_logits,
-            edgelv_indices,
-            locations,
-            self.env.num_edge_types,
-        )
-
-    def cond_forward(self, states: List[GraphState], cond_states: List[GraphState]):
-        if not isinstance(cond_states, list):
-            cond_states = [cond_states] * len(states)
-
-        g = self.env.collate(states, cond_states)
-        embeddings = self.embed(g)
-
-        glob = embeddings["graph_embeddings"]
-        ne_emb = embeddings["non_edge_embeddings"]
-        n_emb = embeddings["node_embeddings"]
-
-        # init mask
-        is_init_node = torch.isin(g.batch, g.init_index)
-        wl_mask = index_utils.to_mask(g.wl_node_index, g.num_nodes)
-        is_valid_init = is_init_node & wl_mask
-
-        # forward
-        init_logits = self.cond_mlp["init"](n_emb[is_valid_init]).flatten()
-        nodelv_logits = self.cond_mlp["nodelv"](glob[g.is_nodelv])
-        edge_target_logits = self.cond_mlp["edgelv"](ne_emb)
-
-        # mask nodelv
-        nodelv_mask = self.make_node_mask(g, states, cond_states)
-        nodelv_logits = nodelv_mask + nodelv_logits
-
-        # mask edgelv
-        # mask edges not in conditional graph
-        # mask stop actions if conditional graph is not stop action
-        edge_mask, stop_mask = self.make_edge_mask(g, states, cond_states)
-        edge_target_logits = edge_mask + edge_target_logits
-        # concat stop actions
-        edgelv_logits = torch.cat([stop_mask, edge_target_logits.flatten()], 0)
-        edge_target_indices = torch.arange(g.num_graphs).repeat_interleave(
-            g.num_non_edges * self.env.num_edge_types
-        )
-        edgelv_indices = torch.cat([g.edgelv_index, edge_target_indices])
-
-        locations = torch.cat([g.init_index, g.nodelv_index, g.edgelv_index])
-
-        cond_info = dict(
-            init_indices=g.batch[is_valid_init],
-            node_types=g.node_type[is_valid_init],
-            init_node_labels=g.node_label[is_valid_init],
-            # nodelv_node_labels=g.node_label[is_valid_init]
-        )
-
-        return ActionCategorical(
-            init_logits=init_logits,
-            nodelv_logits=nodelv_logits,
-            edgelv_logits=edgelv_logits,
-            edgelv_indices=edgelv_indices,
-            logits_locations=locations,
-            num_edge_types=self.env.num_edge_types,
-            cond_info=cond_info,
-        )
-
-    def embed(self, g: gd.Batch):
-        x = (
-            self.emb["node_type"](g.node_type)
-            + self.emb["node_state_type"](g.node_state_type)
-            + self.emb["frontier_order"](g.frontier_order)
-        )
-        e = self.emb["edge_type"](g.edge_type)
-        c = self.emb["virtual_node"](
-            torch.zeros(g.num_graphs, dtype=torch.long, device=self.device)
-        )  # can be used to condition graph-level features.
+    def forward(self, g):
+        x, e, c = g.x, g.edge_attr, g.cond
 
         # Append the virtual node embedding
         x_aug = torch.cat([x, c], 0)
@@ -231,6 +112,177 @@ class GraphModel(nn.Module):
             l_h = linear(trans(torch.cat([x_norm, agg], 1), edge_index, edge_attr))
             x = x + ff(norm2(l_h, batch))
         return x
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+
+class GraphPolicy(nn.Module):
+    def __init__(
+        self, env: GraphEnv, emb_dim: int = 64, num_layers: int = 3, num_heads: int = 2
+    ):
+        super().__init__()
+        self.env = env
+        self.transf = GraphTransformer(emb_dim, num_layers, num_heads)
+        self.logZ = nn.Parameter(torch.tensor(1.0, dtype=torch.float))
+        self.emb = nn.ModuleDict(
+            {
+                "frontier_order": PositionalEncoding(emb_dim),
+                "node_type": nn.Embedding(env.num_node_types + 1, emb_dim),
+                "edge_type": nn.Embedding(env.num_edge_types, emb_dim),
+                "node_state_type": nn.Embedding(4, emb_dim),
+                "virtual_node": nn.Embedding(1, emb_dim),
+            }
+        )
+        self.mlp = nn.ModuleDict(
+            {
+                "init": mlp(emb_dim, emb_dim, env.num_node_types),
+                "nodelv": mlp(
+                    emb_dim, emb_dim, env.num_edge_types * env.num_node_types + 1
+                ),
+                "edgelv": TwoHeadMLP(
+                    [emb_dim, emb_dim, 1],
+                    [emb_dim, emb_dim, env.num_edge_types],
+                ),
+            }
+        )
+        self.cond_mlp = nn.ModuleDict(
+            {
+                "init": mlp(emb_dim, emb_dim, 1),
+                "nodelv": mlp(emb_dim, emb_dim, 1),
+                "edgelv": mlp(emb_dim, emb_dim, env.num_edge_types),
+            }
+        )
+
+    def get_embeddings(self, g):
+        g.x = (
+            self.emb["node_type"](g.node_type)
+            + self.emb["node_state_type"](g.node_state_type)
+            + self.emb["frontier_order"](g.frontier_order)
+        )
+        g.edge_attr = self.emb["edge_type"](g.edge_type)
+        g.cond = self.emb["virtual_node"](
+            torch.zeros(g.num_graphs, dtype=torch.long, device=self.device)
+        )
+        embeddings = self.transf(g)
+        return embeddings
+
+    def forward(self, states: List[GraphState]):
+        sorted_states = SortedStates(states)
+        g = self.env.collate(sorted_states)
+
+        assert sorted_states.sizes[-1] == 0, "Terminal state may cause errors"
+        embeddings = self.get_embeddings(g)
+
+        _, i, j, k, _ = g.sptr
+        init_glob = embeddings["graph_embeddings"][:i]
+        nodelv_glob = embeddings["graph_embeddings"][i:j]
+        edgelv_glob = embeddings["graph_embeddings"][j:k]
+        ne_emb = embeddings["non_edge_embeddings"]
+
+        init_logits = self.mlp["init"](init_glob)
+        nodelv_logits = self.mlp["nodelv"](nodelv_glob)
+        edgelv_logits = self.mlp["edgelv"](edgelv_glob, ne_emb)
+
+        edgelv_stop_index = torch.arange(k - j)
+        edgelv_tgt_index = edgelv_stop_index.repeat_interleave(
+            g.num_non_edges[j:k] * self.env.num_edge_types
+        )
+        edgelv_index = torch.cat([edgelv_stop_index, edgelv_tgt_index])
+
+        init_cat = DefaultCategorical(logits=init_logits)
+        nodelv_cat = DefaultCategorical(logits=nodelv_logits)
+        edgelv_cat = FlatCategorical(logits=edgelv_logits, indices=edgelv_index)
+
+        return ActionCategorical(
+            init_cat,
+            nodelv_cat,
+            edgelv_cat,
+            self.env.num_edge_types,
+            sorted_states.indices(),
+        )
+
+    def cond_forward(self, states):
+        sorted_states = SortedStates(states)
+        g = self.env.collate(sorted_states)
+
+        assert sorted_states.sizes[-1] == 0, "Terminal state may cause errors"
+        embeddings = self.get_embeddings(g)
+
+        _, i, j, k, _ = g.nptr
+        init_nemb = embeddings["node_embeddings"][:i]
+        nodelv_nemb = embeddings["node_embeddings"][i:j]
+        edgelv_nemb = embeddings["node_embeddings"][j:k]
+
+        init_targets, init_node_types, init_mappings = get_init_targets(
+            sorted_states.initial
+        )
+        nodelv_targets, *_ = get_nodelv_targets(sorted_states.node_level)
+        i, j = get_edgelv_targets(sorted_states.edge_level)
+
+        init_logits = self.cond_mlp["init"](init_nemb[init_targets])
+        nodelv_logits = self.cond_mlp["nodelv"](nodelv_nemb[nodelv_targets])
+        edgelv_logits = self.cond_mlp["edgelv"](edgelv_nemb[i] + edgelv_nemb[j])
+
+    def cond_forward(self, states: List[GraphState], cond_states: List[GraphState]):
+        if not isinstance(cond_states, list):
+            cond_states = [cond_states] * len(states)
+
+        g = self.env.collate(states, cond_states)
+        embeddings = self.embed(g)
+
+        glob = embeddings["graph_embeddings"]
+        ne_emb = embeddings["non_edge_embeddings"]
+        n_emb = embeddings["node_embeddings"]
+
+        # init mask
+        is_init_node = torch.isin(g.batch, g.init_index)
+        wl_mask = index_utils.to_mask(g.wl_node_index, g.num_nodes)
+        is_valid_init = is_init_node & wl_mask
+
+        # node mask
+        is_valid_node = ...
+
+        # forward
+        init_logits = self.cond_mlp["init"](n_emb[is_valid_init]).flatten()
+        nodelv_logits = self.cond_mlp["nodelv"](n_emb[is_valid_node]).flatten()
+        edge_target_logits = self.cond_mlp["edgelv"](ne_emb)
+
+        # mask nodelv
+        nodelv_mask = self.make_node_mask(g, states, cond_states)
+        nodelv_logits = nodelv_mask + nodelv_logits
+
+        # mask edgelv
+        # mask edges not in conditional graph
+        # mask stop actions if conditional graph is not stop action
+        edge_mask, stop_mask = self.make_edge_mask(g, states, cond_states)
+        edge_target_logits = edge_mask + edge_target_logits
+        # concat stop actions
+        edgelv_logits = torch.cat([stop_mask, edge_target_logits.flatten()], 0)
+        edge_target_indices = torch.arange(g.num_graphs).repeat_interleave(
+            g.num_non_edges * self.env.num_edge_types
+        )
+        edgelv_indices = torch.cat([g.edgelv_index, edge_target_indices])
+
+        locations = torch.cat([g.init_index, g.nodelv_index, g.edgelv_index])
+
+        cond_info = dict(
+            init_indices=g.batch[is_valid_init],
+            node_types=g.node_type[is_valid_init],
+            init_node_labels=g.node_label[is_valid_init],
+            # nodelv_node_labels=g.node_label[is_valid_init]
+        )
+
+        return ActionCategorical(
+            init_logits=init_logits,
+            nodelv_logits=nodelv_logits,
+            edgelv_logits=edgelv_logits,
+            edgelv_indices=edgelv_indices,
+            logits_locations=locations,
+            num_edge_types=self.env.num_edge_types,
+            cond_info=cond_info,
+        )
 
     def make_node_mask(self, g, states, conds):
         """
@@ -285,9 +337,7 @@ class GraphModel(nn.Module):
 
             mask = torch.zeros(len(tgt), self.env.num_edge_types, dtype=torch.bool)
             if valid_targets:
-                valid_tgt_index, valid_tgt = zip(
-                    *[(i, t) for i, t in enumerate(tgt) if t in cond_edges]
-                )
+                valid_tgt_index, valid_tgt = zip(*valid_targets)
                 valid_tgt_index = torch.LongTensor(valid_tgt_index)
                 valid_type_index = torch.LongTensor(
                     [

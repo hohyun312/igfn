@@ -1,7 +1,7 @@
 import torch
 
 
-def rearange(indices):
+def relabel_mapping(indices):
     # input : [3, 3, 4, 7, 7, 0]
     # output: [1, 1, 2, 3, 3, 0]
     u = indices.unique(sorted=True)
@@ -12,7 +12,7 @@ def rearange(indices):
     return mapping
 
 
-def inv_rearange(mapping):
+def inv_relabel_mapping(mapping):
     n = max(mapping)
     inv_mapping = torch.empty(n + 2, dtype=torch.long)  # last index is for -1 indices
     index = torch.where(mapping == -1, n + 1, mapping)

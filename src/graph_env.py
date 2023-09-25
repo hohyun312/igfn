@@ -14,6 +14,7 @@ from src.containers import (
     GraphStateType,
     NodeStateType,
     Trajectory,
+    SortedStates,
 )
 from src.wl_hash import weisfeiler_lehman_graph_hash
 from src import index_utils
@@ -36,6 +37,27 @@ def _get_unique_nodes(graph: nx.Graph, iterations: int = 4):
         if node_labels[i] not in visited:
             visited.add(node_labels[i])
             output.append(i)
+    return output
+
+
+def _hash_nodes(graph: nx.Graph, iterations: int = 4):
+    """
+    Map each node to an integer according to weisfeiler lehman hash.
+    """
+    node_labels = weisfeiler_lehman_graph_hash(
+        graph,
+        iterations=iterations,
+        edge_attr="edge_type",
+        node_attr="node_type",
+    )
+    hash2num = {}
+    output = []
+    for i in sorted(node_labels):
+        label = node_labels[i]
+        if label not in hash2num:
+            hash2num[label] = len(hash2num)
+
+        output.append(hash2num[label])
     return output
 
 
@@ -240,8 +262,8 @@ class GraphEnv:
         )
 
         # Mapping node indices. This is to ensure label invariance.
-        mapping = index_utils.rearange(edge_index)
-        node_mapping = index_utils.inv_rearange(mapping)
+        mapping = index_utils.relabel_mapping(edge_index)
+        node_mapping = index_utils.inv_relabel_mapping(mapping)
         edge_index = mapping[edge_index]
         non_edge_index = mapping[non_edge_index]
 
@@ -284,10 +306,10 @@ class GraphEnv:
                     g = self.to_tensor_graph(c)
                     # pretend to be inital state
                     g.state_type = GraphStateType.Initial.value
-                    g.wl_node_index = torch.LongTensor(_get_unique_nodes(c.graph))
+                    # g.wl_node_index = torch.LongTensor(_get_unique_nodes(c.graph))
                 else:
                     g = self.to_tensor_graph(s)
-                    g.wl_node_index = torch.LongTensor([])
+                    # g.wl_node_index = torch.LongTensor([])
                 data_list[i] = g
 
         graphs = gd.Batch.from_data_list(data_list)
@@ -300,4 +322,10 @@ class GraphEnv:
         graphs.nodelv_index = graphs.is_nodelv.nonzero().flatten()
         graphs.edgelv_index = graphs.is_edgelv.nonzero().flatten()
         graphs.terminal_index = graphs.is_terminal.nonzero().flatten()
+        return graphs
+
+    def collate(self, sorted_states: SortedStates):
+        data_list = [self.to_tensor_graph(s) for s in sorted_states.tolist()]
+        graphs = gd.Batch.from_data_list(data_list)
+        graphs.sptr = torch.cumsum(torch.LongTensor([0] + sorted_states.sizes), dim=0)
         return graphs

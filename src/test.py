@@ -10,7 +10,7 @@ from src.containers import (
     GraphAction,
 )
 from src.graph_env import GraphEnv
-from src.models import GraphModel
+from src.models import GraphPolicy
 
 
 from unittest import TestCase
@@ -113,7 +113,7 @@ class Test(TestCase):
 
     def test_overfit1(self):
         traj = env.graph_bfs_trajectory(G, new_index=True)
-        model = GraphModel(env)
+        model = GraphPolicy(env)
         train_overfit(model, traj)
         state = sample_from_model(env, model)
         is_iso = nx.is_isomorphic(state.graph, G)
@@ -121,7 +121,7 @@ class Test(TestCase):
 
     def test_overfit2(self):
         traj = env.graph_bfs_trajectory(G, new_index=False)
-        model = GraphModel(env)
+        model = GraphPolicy(env)
         train_overfit(model, traj)
         state = sample_from_model(env, model)
         is_iso = nx.is_isomorphic(state.graph, G)
