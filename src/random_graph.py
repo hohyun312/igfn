@@ -44,7 +44,7 @@ def perturb(batch, p=0.2):
     Randomly remove one edge with probability p.
     '''
     perturbed = []
-    for x in batch:
+    for state in batch:
         if np.random.random() < p:
             edge = np.random.choice(state.num_edges)
             u, v = state.edge_list[edge]
