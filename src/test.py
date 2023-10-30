@@ -1,128 +1,273 @@
-import numpy as np
-import torch
-import networkx as nx
-
-from src.random_graph import n_community
-from src.containers import (
-    GraphStateType,
-    GraphState,
-    GraphActionType,
-    GraphAction,
-)
-from src.graph_env import GraphEnv
-from src.models import GraphPolicy
-
-
 from unittest import TestCase
 
+from collections import Counter
+import math
 
-def wl_iso_mol():
-    # decalin
-    # C1CCC2CCCCC2C1
-    # Bicyclopentyl
-    # C1CCC(C1)C2CCCC2
-    from src.mgraph import MolGraph
+import networkx as nx
 
-    states = [
-        GraphState(GraphStateType.Terminal, MolGraph.from_smiles("C1CCC2CCCCC2C1")),
-        GraphState(GraphStateType.Terminal, MolGraph.from_smiles("C1CCC(C1)C2CCCC2")),
-    ]
-    return states
+import torch
+from torch_scatter import scatter_log_softmax
 
-
-def fake_data():
-    states = [GraphState.initial_state()]
-    actions = [
-        GraphAction(GraphActionType.Init, node_type=0, target=0),
-        GraphAction(GraphActionType.AddNode, node_type=0, edge_type=0),
-        GraphAction(GraphActionType.AddNode, node_type=0, edge_type=1),
-        GraphAction(GraphActionType.AddEdge, edge_type=0, target=0),
-        GraphAction(GraphActionType.StopNode),
-        GraphAction(GraphActionType.StopNode),
-        GraphAction(GraphActionType.AddNode, node_type=1, edge_type=0),
-        GraphAction(GraphActionType.AddNode, node_type=1, edge_type=0),
-        GraphAction(GraphActionType.StopEdge),
-        GraphAction(GraphActionType.StopNode),
-        GraphAction(GraphActionType.StopNode),
-        GraphAction(GraphActionType.StopNode),
-    ]
-    actions = [
-        GraphAction(GraphActionType.Init, node_type=0, target=0),
-        GraphAction(GraphActionType.AddNode, node_type=0, edge_type=0, target=1),
-        GraphAction(GraphActionType.AddNode, node_type=0, edge_type=0, target=2),
-        GraphAction(GraphActionType.StopEdge, edge_type=0, target=0),
-        GraphAction(GraphActionType.StopNode),
-        GraphAction(GraphActionType.StopNode),
-        GraphAction(GraphActionType.StopNode),
-    ]
-    for act in actions:
-        states += [states[-1].apply_action(act)]
-    return states, actions, states[-1]
+from src.utils import VariadicCategorical, PlackettLuce
+from src.bfsenv import (
+    GraphBuildingEnv,
+    State,
+    StateType,
+    Action,
+    ActionType,
+    Trajectory,
+    BatchedState,
+    BackwardActionDistribution,
+)
+from src.models import GraphPolicy, GraphEmbedding
 
 
-c_sizes = np.random.choice([12, 13, 14, 15, 16, 17], 2)
-G = n_community([5, 7], p=0.4, p_inter=0.1)
+regular_state = State(  # d=3, n=10, regular graph
+    StateType.Terminal,
+    [0] * 10,
+    [0] * 30,
+    [
+        [0, 6],
+        [6, 0],
+        [0, 9],
+        [9, 0],
+        [2, 4],
+        [4, 2],
+        [2, 6],
+        [6, 2],
+        [2, 9],
+        [9, 2],
+        [3, 1],
+        [1, 3],
+        [3, 5],
+        [5, 3],
+        [3, 8],
+        [8, 3],
+        [4, 0],
+        [0, 4],
+        [4, 8],
+        [8, 4],
+        [5, 7],
+        [7, 5],
+        [6, 1],
+        [1, 6],
+        [7, 1],
+        [1, 7],
+        [8, 7],
+        [7, 8],
+        [9, 5],
+        [5, 9],
+    ],
+)
 
-env = GraphEnv(2, 2)
+
+actions1 = [
+    Action(ActionType.First, node_type=0),
+    Action(ActionType.AddNode, node_type=0, edge_type=0),
+    Action(ActionType.AddNode, node_type=0, edge_type=1),
+    Action(ActionType.AddEdge, edge_type=0, target=0),
+    Action(ActionType.StopNode),
+    Action(ActionType.StopNode),
+    Action(ActionType.AddNode, node_type=1, edge_type=0),
+    Action(ActionType.AddNode, node_type=1, edge_type=0),
+    Action(ActionType.StopEdge),
+    Action(ActionType.StopNode),
+    Action(ActionType.StopNode),
+    Action(ActionType.StopNode),
+]
+
+actions2 = [
+    Action(ActionType.First, node_type=0),
+    Action(ActionType.AddNode, node_type=0, edge_type=0, target=1),
+    Action(ActionType.AddNode, node_type=0, edge_type=0, target=2),
+    Action(ActionType.StopEdge, edge_type=0, target=0),
+    Action(ActionType.StopNode),
+    Action(ActionType.StopNode),
+    Action(ActionType.StopNode),
+]
+
+env = GraphBuildingEnv(3, 3, max_degree=10)
 
 
-def follow_actions(env, traj):
-    s = env.initial_state()
-    for a in traj.actions:
-        s = env.step(s, a)
-    return s
+def follow_actions(actions):
+    state = env.initial_state()
+    states = [state]
+    for action in actions:
+        state = env.step(state, action, copy=True)
+        states.append(state)
+    return Trajectory(states, actions)
 
 
-def train_overfit(model, traj, n_updates=200):
+class TestEnv(TestCase):
+    def test_step1(self):
+        state = env.initial_state()
+        for action in actions1:
+            env.step(state, action, copy=False)
+            self.check_valid_graph_state(state)
+
+    def test_step2(self):
+        state = env.initial_state()
+        for action in actions2:
+            env.step(state, action, copy=False)
+            self.check_valid_graph_state(state)
+
+    def check_valid_graph_state(self, state: State):
+        # not exhaustive
+        if state.state_type == StateType.EdgeLevel:
+            self.assertIsNotNone(state.edge_source)
+            self.assertIsNotNone(state.node_source)
+        elif state.state_type == StateType.NodeLevel:
+            self.assertIsNotNone(state.node_source)
+
+
+class TestVarCat(TestCase):
+    def test_log_prob(self):
+        logits = torch.tensor([1, 1, 1, 1, 1, 1]).float()
+        indices = torch.tensor([0, 0, 1, 0, 1, 2])
+        value = torch.tensor([1, 1, 0])
+
+        log_probs = scatter_log_softmax(logits, indices)
+        log_probs_ = VariadicCategorical(logits, indices).log_prob(value)
+
+        value = all(log_probs[[1, -2, -1]] == log_probs_)
+        self.assertTrue(value)
+
+
+def train_overfit(model, traj, n_updates=50):
     optimizer = torch.optim.Adam(model.parameters())
-
+    losses = []
     for _ in range(n_updates):
-        cat = model(traj.states[:-1])
-        log_probs = cat.log_prob(traj.actions)
+        cat = model.forward_action(BatchedState(traj.get_states()))
+        log_probs = cat.log_prob(traj.get_actions())
         loss = -log_probs.sum()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        losses.append(loss.item())
+
+    return losses
 
 
 def sample_from_model(env, model):
     state = env.initial_state()
+    actions = []
+    states = [state]
     for _ in range(300):
-        cat = model([state])
+        cat = model.forward_action(BatchedState([state]))
         action = cat.sample()[0]
         state = env.step(state, action)
+        states.append(state)
+        actions.append(action)
 
-        if state.state_type == env.GraphStateType.Terminal:
+        if state.state_type == StateType.Terminal:
             break
-    return state
+    return Trajectory(states, actions)
 
 
-class Test(TestCase):
-    def test_trajectory1(self):
-        traj = env.graph_bfs_trajectory(G, new_index=True)
-        new_traj = env.follow_actions(traj.actions)
-        is_iso = nx.is_isomorphic(G, new_traj.last_state.graph)
-        self.assertTrue(is_iso)
-
-    def test_trajectory2(self):
-        traj = env.graph_bfs_trajectory(G, new_index=False)
-        new_traj = env.follow_actions(traj.actions)
-        is_iso = nx.is_isomorphic(G, new_traj.last_state.graph)
-        self.assertTrue(is_iso)
-
-    def test_overfit1(self):
-        traj = env.graph_bfs_trajectory(G, new_index=True)
-        model = GraphPolicy(env)
+class TestModel(TestCase):
+    def test_forward1(self):
+        embedding = GraphEmbedding(env)
+        model = GraphPolicy(embedding)
+        traj = follow_actions(actions1)
         train_overfit(model, traj)
-        state = sample_from_model(env, model)
-        is_iso = nx.is_isomorphic(state.graph, G)
-        self.assertTrue(is_iso)
+        sample = sample_from_model(env, model)
+        G1, G2 = traj.get_last_state().to_nx(), sample.get_last_state().to_nx()
 
-    def test_overfit2(self):
-        traj = env.graph_bfs_trajectory(G, new_index=False)
-        model = GraphPolicy(env)
+        self.assertTrue(nx.is_isomorphic(G1, G2))
+
+    def test_forward2(self):
+        embedding = GraphEmbedding(env)
+        model = GraphPolicy(embedding)
+        traj = follow_actions(actions2)
         train_overfit(model, traj)
-        state = sample_from_model(env, model)
-        is_iso = nx.is_isomorphic(state.graph, G)
-        self.assertTrue(is_iso)
+        sample = sample_from_model(env, model)
+        G1, G2 = traj.get_last_state().to_nx(), sample.get_last_state().to_nx()
+
+        self.assertTrue(nx.is_isomorphic(G1, G2))
+
+
+class TestPlackettLuce(TestCase):
+    def test_logprob(self):
+        # single sample logprob
+        order = [3, 0, 2, 1, 4, 6, 5]
+        logits = torch.randn(7, requires_grad=True)
+        mask = torch.ones(7, dtype=torch.bool)
+
+        log_prob = []
+        for i in order:
+            masked_logits = torch.where(mask, logits, -torch.inf)
+            logp = torch.log_softmax(masked_logits, 0)[i]
+            mask[i] = False
+            log_prob.append(logp)
+
+        totabl_log_prob1 = sum(log_prob).item()
+
+        # computed via PlackettLuce class
+        sizes = torch.tensor([len(logits)], dtype=torch.long)
+        order = torch.LongTensor(order)
+        totabl_log_prob2 = PlackettLuce(logits, sizes).log_prob(order).item()
+
+        self.assertAlmostEqual(totabl_log_prob1, totabl_log_prob2)
+
+    def test_sample(self):
+        logits = torch.ones(5, requires_grad=True)
+        sizes = torch.LongTensor([2, 3])
+        luce = PlackettLuce(logits, sizes)
+
+        samples = []
+        for _ in range(1000):
+            orders = luce.sample().split(tuple(sizes))
+            samples += [tuple(x.numpy()) for x in orders]
+
+        counts = Counter(samples)
+        self.assertTrue(0.45 < counts[(0, 1)] / 1000 < 0.55)
+        self.assertTrue(0.45 < counts[(1, 0)] / 1000 < 0.55)
+        self.assertTrue(0.166 - 0.05 < counts[(0, 1, 2)] / 1000 < 0.166 + 0.05)
+        self.assertTrue(0.166 - 0.05 < counts[(0, 2, 1)] / 1000 < 0.166 + 0.05)
+        self.assertTrue(0.166 - 0.05 < counts[(1, 0, 2)] / 1000 < 0.166 + 0.05)
+        self.assertTrue(0.166 - 0.05 < counts[(1, 2, 0)] / 1000 < 0.166 + 0.05)
+        self.assertTrue(0.166 - 0.05 < counts[(2, 0, 1)] / 1000 < 0.166 + 0.05)
+        self.assertTrue(0.166 - 0.05 < counts[(2, 1, 0)] / 1000 < 0.166 + 0.05)
+
+    def test_output(self):
+        logits = torch.tensor([-100, 100, 0]).float()
+        sizes = torch.tensor([3])
+        pl = PlackettLuce(logits, sizes)
+        permu = pl.sample()
+        logp = pl.log_prob(permu).exp()
+
+        self.assertEqual(permu.tolist(), [1, 2, 0])
+        self.assertAlmostEqual(logp.item(), 1.0)
+
+
+class TestBFSPlackettLuce(TestCase):
+    def test_logprob(self):
+        logit = torch.ones(5)
+        neighbors = [[[1, 2, 3, 4], [0], [0], [0], [0]]]
+        sizes = torch.tensor([5])
+
+        bfspl = BackwardActionDistribution(logit, sizes, neighbors, torch.tensor(1.0))
+
+        node_order = torch.LongTensor([0, 1, 2, 3, 4])
+        prob = bfspl.log_prob(node_order).exp()
+        d = math.factorial(5)
+
+        self.assertAlmostEqual(prob.item(), 1 / d)
+
+        node_order = torch.LongTensor([1, 0, 2, 3, 4])
+        prob = bfspl.log_prob(node_order).exp()
+
+        self.assertAlmostEqual(prob.item(), 4 / d)
+
+    def test_sample(self):
+        logit = torch.ones(4)
+        neighbors = [[[1, 2, 3], [0], [0], [0]]]
+        sizes = torch.tensor([4])
+        bfspl = BackwardActionDistribution(logit, sizes, neighbors, torch.tensor(1.0))
+
+        N = 0
+        for _ in range(1000):
+            N += bfspl.sample()[0].item() == 0
+
+        self.assertTrue(220 < N < 280)
