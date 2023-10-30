@@ -129,6 +129,7 @@ class State:
         for u, v in self.edge_list:
             neighbor[u].append(v)
         self.adj = neighbor
+        return self
 
     def get_neighboring_edge_attr(self):
         attr = [[] for _ in range(self.num_nodes)]
@@ -234,7 +235,7 @@ class State:
         node_type = [attr.get("node_type", 0) for i, attr in nodes]
         edge_type = sum([[attr.get("edge_type", 0)] * 2 for u, v, attr in edges], [])
         edge_list = [e for u, v, _ in edges for e in [(u, v), (v, u)]]
-        return cls(StateType.Terminal, node_type, edge_type, edge_list)
+        return cls(StateType.Terminal, node_type, edge_type, edge_list).build_adjacency_list()
 
     def visualize(self, figsize=(3, 3), node_color="node_type", bfs_root=None, **kargs):
         def bfs_order(neighbors, root=0):
