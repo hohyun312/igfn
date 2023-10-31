@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.utils import add_self_loops
 import torch_geometric.nn as gnn
 import torch_geometric.data as gd
+from torch_scatter import scatter_add
 
 from src.utils import DefaultCategorical, VariadicCategorical
 from src.bfsenv import (
@@ -196,7 +197,7 @@ class GraphPolicy(nn.Module):
         super().__init__()
         self.graph_embedding = graph_embedding
 
-        env = graph_embedding.env
+        self.env = env = graph_embedding.env
         emb_dim = graph_embedding.emb_dim
         self.mlp = nn.ModuleDict(
             {
@@ -213,7 +214,8 @@ class GraphPolicy(nn.Module):
                 "backward": FullyConnected(emb_dim, [emb_dim], 1),
             }
         )
-
+        self.logZ = nn.Parameter(torch.tensor(0.0))
+        
     def backward_action(self, batch: BatchedState):
         g = self.graph_embedding(batch, terminal=True)
         logits = self.mlp["backward"](g.emb["node_embeddings"]).flatten()
@@ -258,13 +260,27 @@ class GraphPolicy(nn.Module):
             num_edge_types,
             batch.sort_indices(),
         )
+    
+    def loss(self, samples: BatchedState, logR: torch.Tensor): # logZ
+        traj = self.env.state_to_trajectory(samples)
+        
+        fwd_act = self.forward_action(traj.get_states())
+        log_pf_s = fwd_act.log_prob(traj.get_actions())
+        t_idx = torch.repeat_interleave(traj.get_length())
+        log_pf = scatter_add(log_pf_s, t_idx)
+        
+        bwd_act = self.backward_action(samples)
+        log_pb = bwd_act.log_prob(samples.get_node_order())
+            
+        loss = (self.logZ + log_pf - log_pb - logR).square()
+        return loss
 
     @property
     def device(self):
         return next(self.parameters()).device
 
 
-class EnergyModel(nn.Module):
+class RewardModel(nn.Module):
     def __init__(self, graph_embedding):
         super().__init__()
         self.graph_embedding = graph_embedding
@@ -273,8 +289,19 @@ class EnergyModel(nn.Module):
         )
 
     def forward(self, batch: BatchedState):
+        '''log reward'''
         g = self.graph_embedding(batch, terminal=True)
         return self.mlp(g.emb["graph_embeddings"]).flatten()
+    
+    def loss(self, pos_x, neg_x, alpha=0.1):
+        pos_out = self(pos_x)
+        neg_out = self(neg_x)
+    
+        loss = pos_out - neg_out
+        reg = pos_out.square() + neg_out.square()
+        
+        return -loss + alpha * reg
+        
 
     @property
     def device(self):
