@@ -1,8 +1,8 @@
-
 import numpy as np
 import networkx as nx
 from copy import deepcopy
-from src.bfsenv import BatchedState, State
+from src.types import BatchedState, State
+
 
 def grid_graph(size=1):
     graphs = []
@@ -13,12 +13,14 @@ def grid_graph(size=1):
         graphs.append(G)
     return BatchedState([State.from_nx(G) for G in graphs])
 
+
 def binomial_tree_graph(size=1):
     graphs = []
     for _ in range(size):
         i = np.random.randint(1, 6)
         graphs.append(nx.binomial_tree(i))
     return BatchedState([State.from_nx(G) for G in graphs])
+
 
 def regular_graph(size=1):
     graphs = []
@@ -35,16 +37,17 @@ def regular_graph(size=1):
             nodes = next(nx.connected_components(G))
             G = nx.subgraph(G, nodes)
             G = nx.relabel_nodes(G, dict(zip(G.nodes, range(len(G)))))
-    
+
         graphs.append(G)
     output = BatchedState([State.from_nx(G) for G in graphs])
     return output
 
+
 def perturb_edge(batch, p=0.2):
-    '''
+    """
     Randomly remove one edge with probability p.
     Warning: Can generate disconnected graph.
-    '''
+    """
     perturbed = []
     for state in batch:
         if np.random.random() < p:
@@ -56,8 +59,8 @@ def perturb_edge(batch, p=0.2):
                 edge = edge - edge % 2
                 i, j = edge, edge + 1
                 u, v = state.edge_list[i]
-                state.edge_type = state.edge_type[:i] + state.edge_type[j+1:]
-                state.edge_list = state.edge_list[:i] + state.edge_list[j+1:]
+                state.edge_type = state.edge_type[:i] + state.edge_type[j + 1 :]
+                state.edge_list = state.edge_list[:i] + state.edge_list[j + 1 :]
                 state.adj[u].pop(state.adj[u].index(v))
                 state.adj[v].pop(state.adj[v].index(u))
         perturbed.append(state)

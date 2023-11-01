@@ -6,12 +6,12 @@ import torch_geometric.nn as gnn
 import torch_geometric.data as gd
 from torch_scatter import scatter_add
 
-from src.utils import DefaultCategorical, VariadicCategorical
-from src.bfsenv import (
-    GraphBuildingEnv,
-    BatchedState,
+from src.types import StateType, BatchedState, BatchedTrajectory
+from src.samplers import (
     ForwardActionDistribution,
     BackwardActionDistribution,
+    DefaultCategorical,
+    VariadicCategorical,
 )
 
 
@@ -139,24 +139,26 @@ class GraphTransformer(nn.Module):
 class GraphEmbedding(nn.Module):
     def __init__(
         self,
-        env: GraphBuildingEnv,
+        num_node_types: int,
+        num_edge_types: int,
         emb_dim: int = 64,
         num_layers: int = 3,
         num_heads: int = 2,
     ):
         super().__init__()
-        self.env = env
+        self.num_node_types = num_node_types
+        self.num_edge_types = num_edge_types
         self.emb_dim = emb_dim
         self.transf = GraphTransformer(emb_dim, num_layers, num_heads)
         self.emb = nn.ModuleDict(
             {
                 "node_order": gnn.PositionalEncoding(emb_dim),
-                "node_type": nn.Embedding(env.num_node_types + 1, emb_dim),
+                "node_type": nn.Embedding(num_node_types + 1, emb_dim),
                 "node_state": nn.Embedding(
                     4, emb_dim, padding_idx=0
                 ),  # node_source, queue, edge_source
-                "edge_type": nn.Embedding(env.num_edge_types, emb_dim),
-                "glob_node": nn.Embedding(len(env.StateType), emb_dim),
+                "edge_type": nn.Embedding(num_edge_types, emb_dim),
+                "glob_node": nn.Embedding(len(StateType), emb_dim),
             }
         )
 
@@ -193,29 +195,36 @@ class GraphEmbedding(nn.Module):
 
 
 class GraphPolicy(nn.Module):
-    def __init__(self, graph_embedding):
+    def __init__(
+        self,
+        num_node_types: int,
+        num_edge_types: int,
+        emb_dim: int = 64,
+        num_layers: int = 3,
+        num_heads: int = 2,
+    ):
         super().__init__()
-        self.graph_embedding = graph_embedding
-
-        self.env = env = graph_embedding.env
-        emb_dim = graph_embedding.emb_dim
+        self.graph_embedding = GraphEmbedding(
+            num_node_types, num_edge_types, emb_dim, num_layers, num_heads
+        )
+        self.num_edge_types = num_edge_types
         self.mlp = nn.ModuleDict(
             {
-                "init": FullyConnected(emb_dim, [emb_dim], env.num_node_types),
+                "init": FullyConnected(emb_dim, [emb_dim], num_node_types),
                 "nodelv": FullyConnected(
                     emb_dim,
                     [emb_dim],
-                    env.num_edge_types * env.num_node_types + 1,
+                    num_edge_types * num_node_types + 1,
                 ),
                 "edgelv": TwoStreamMLP(
                     [emb_dim, [emb_dim], 1],
-                    [emb_dim, [emb_dim], env.num_edge_types],
+                    [emb_dim, [emb_dim], num_edge_types],
                 ),
                 "backward": FullyConnected(emb_dim, [emb_dim], 1),
             }
         )
         self.logZ = nn.Parameter(torch.tensor(0.0))
-        
+
     def backward_action(self, batch: BatchedState):
         g = self.graph_embedding(batch, terminal=True)
         logits = self.mlp["backward"](g.emb["node_embeddings"]).flatten()
@@ -231,7 +240,6 @@ class GraphPolicy(nn.Module):
 
     def forward_action(self, batch: BatchedState):
         g = self.graph_embedding(batch)
-        num_edge_types = self.graph_embedding.env.num_edge_types
 
         _, i, j, k, _ = g.sptr
         init_glob = g.emb["graph_embeddings"][:i]
@@ -245,7 +253,7 @@ class GraphPolicy(nn.Module):
 
         edgelv_stop_index = torch.arange(k - j)
         edgelv_tgt_index = torch.repeat_interleave(
-            g.num_non_edges[j:k] * num_edge_types
+            g.num_non_edges[j:k] * self.num_edge_types
         )
         edgelv_index = torch.cat([edgelv_stop_index, edgelv_tgt_index])
 
@@ -257,21 +265,20 @@ class GraphPolicy(nn.Module):
             init_cat,
             nodelv_cat,
             edgelv_cat,
-            num_edge_types,
+            self.num_edge_types,
             batch.sort_indices(),
         )
-    
-    def loss(self, samples: BatchedState, logR: torch.Tensor): # logZ
-        traj = self.env.state_to_trajectory(samples)
-        
+
+    def loss(self, traj: BatchedTrajectory, logR: torch.Tensor):  # logZ
         fwd_act = self.forward_action(traj.get_states())
         log_pf_s = fwd_act.log_prob(traj.get_actions())
         t_idx = torch.repeat_interleave(traj.get_length())
         log_pf = scatter_add(log_pf_s, t_idx)
-        
-        bwd_act = self.backward_action(samples)
-        log_pb = bwd_act.log_prob(samples.get_node_order())
-            
+
+        last_state = traj.get_last_state()
+        bwd_act = self.backward_action(last_state)
+        log_pb = bwd_act.log_prob(last_state.get_node_order())
+
         loss = (self.logZ + log_pf - log_pb - logR).square()
         return loss
 
@@ -281,27 +288,33 @@ class GraphPolicy(nn.Module):
 
 
 class RewardModel(nn.Module):
-    def __init__(self, graph_embedding):
+    def __init__(
+        self,
+        num_node_types: int,
+        num_edge_types: int,
+        emb_dim: int = 64,
+        num_layers: int = 3,
+        num_heads: int = 2,
+    ):
         super().__init__()
-        self.graph_embedding = graph_embedding
-        self.mlp = FullyConnected(
-            graph_embedding.emb_dim, [2 * graph_embedding.emb_dim], 1
+        self.graph_embedding = GraphEmbedding(
+            num_node_types, num_edge_types, emb_dim, num_layers, num_heads
         )
+        self.mlp = FullyConnected(emb_dim, [2 * emb_dim], 1)
 
     def forward(self, batch: BatchedState):
-        '''log reward'''
+        """log reward"""
         g = self.graph_embedding(batch, terminal=True)
         return self.mlp(g.emb["graph_embeddings"]).flatten()
-    
-    def loss(self, pos_x, neg_x, alpha=0.1):
-        pos_out = self(pos_x)
-        neg_out = self(neg_x)
-    
+
+    def loss(self, positive_sample, negative_sample, alpha=0.1):
+        pos_out = self(positive_sample)
+        neg_out = self(negative_sample)
+
         loss = pos_out - neg_out
         reg = pos_out.square() + neg_out.square()
-        
+
         return -loss + alpha * reg
-        
 
     @property
     def device(self):

@@ -8,8 +8,8 @@ import networkx as nx
 import torch
 from torch_scatter import scatter_log_softmax
 
-from src.utils import VariadicCategorical, PlackettLuce
-from src.bfsenv import (
+from src.samplers import VariadicCategorical, BackwardActionDistribution
+from src.types import (
     GraphBuildingEnv,
     State,
     StateType,
@@ -17,7 +17,6 @@ from src.bfsenv import (
     ActionType,
     Trajectory,
     BatchedState,
-    BackwardActionDistribution,
 )
 from src.models import GraphPolicy, GraphEmbedding
 
@@ -60,6 +59,8 @@ regular_state = State(  # d=3, n=10, regular graph
     ],
 )
 
+num_node_types = 2
+num_edge_types = 2
 
 actions1 = [
     Action(ActionType.First, node_type=0),
@@ -167,8 +168,7 @@ def sample_from_model(env, model):
 
 class TestModel(TestCase):
     def test_forward1(self):
-        embedding = GraphEmbedding(env)
-        model = GraphPolicy(embedding)
+        model = GraphPolicy(num_node_types, num_edge_types)
         traj = follow_actions(actions1)
         train_overfit(model, traj)
         sample = sample_from_model(env, model)
@@ -177,68 +177,13 @@ class TestModel(TestCase):
         self.assertTrue(nx.is_isomorphic(G1, G2))
 
     def test_forward2(self):
-        embedding = GraphEmbedding(env)
-        model = GraphPolicy(embedding)
+        model = GraphPolicy(num_node_types, num_edge_types)
         traj = follow_actions(actions2)
         train_overfit(model, traj)
         sample = sample_from_model(env, model)
         G1, G2 = traj.get_last_state().to_nx(), sample.get_last_state().to_nx()
 
         self.assertTrue(nx.is_isomorphic(G1, G2))
-
-
-class TestPlackettLuce(TestCase):
-    def test_logprob(self):
-        # single sample logprob
-        order = [3, 0, 2, 1, 4, 6, 5]
-        logits = torch.randn(7, requires_grad=True)
-        mask = torch.ones(7, dtype=torch.bool)
-
-        log_prob = []
-        for i in order:
-            masked_logits = torch.where(mask, logits, -torch.inf)
-            logp = torch.log_softmax(masked_logits, 0)[i]
-            mask[i] = False
-            log_prob.append(logp)
-
-        totabl_log_prob1 = sum(log_prob).item()
-
-        # computed via PlackettLuce class
-        sizes = torch.tensor([len(logits)], dtype=torch.long)
-        order = torch.LongTensor(order)
-        totabl_log_prob2 = PlackettLuce(logits, sizes).log_prob(order).item()
-
-        self.assertAlmostEqual(totabl_log_prob1, totabl_log_prob2)
-
-    def test_sample(self):
-        logits = torch.ones(5, requires_grad=True)
-        sizes = torch.LongTensor([2, 3])
-        luce = PlackettLuce(logits, sizes)
-
-        samples = []
-        for _ in range(1000):
-            orders = luce.sample().split(tuple(sizes))
-            samples += [tuple(x.numpy()) for x in orders]
-
-        counts = Counter(samples)
-        self.assertTrue(0.45 < counts[(0, 1)] / 1000 < 0.55)
-        self.assertTrue(0.45 < counts[(1, 0)] / 1000 < 0.55)
-        self.assertTrue(0.166 - 0.05 < counts[(0, 1, 2)] / 1000 < 0.166 + 0.05)
-        self.assertTrue(0.166 - 0.05 < counts[(0, 2, 1)] / 1000 < 0.166 + 0.05)
-        self.assertTrue(0.166 - 0.05 < counts[(1, 0, 2)] / 1000 < 0.166 + 0.05)
-        self.assertTrue(0.166 - 0.05 < counts[(1, 2, 0)] / 1000 < 0.166 + 0.05)
-        self.assertTrue(0.166 - 0.05 < counts[(2, 0, 1)] / 1000 < 0.166 + 0.05)
-        self.assertTrue(0.166 - 0.05 < counts[(2, 1, 0)] / 1000 < 0.166 + 0.05)
-
-    def test_output(self):
-        logits = torch.tensor([-100, 100, 0]).float()
-        sizes = torch.tensor([3])
-        pl = PlackettLuce(logits, sizes)
-        permu = pl.sample()
-        logp = pl.log_prob(permu).exp()
-
-        self.assertEqual(permu.tolist(), [1, 2, 0])
-        self.assertAlmostEqual(logp.item(), 1.0)
 
 
 class TestBFSPlackettLuce(TestCase):
