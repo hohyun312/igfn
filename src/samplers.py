@@ -10,7 +10,7 @@ from torch.distributions import Categorical
 from torch_scatter import scatter_log_softmax, scatter_max
 
 
-from src.types import (
+from src.containers import (
     State,
     StateType,
     BatchedState,
@@ -22,8 +22,9 @@ from src.types import (
 
 
 class Sampler:
-    def __init__(self, model, max_step=100, max_degree=4):
+    def __init__(self, model, max_num_nodes=40, max_step=100, max_degree=4):
         self.model = model
+        self.max_num_nodes = max_num_nodes
         self.max_step = max_step
         self.max_degree = max_degree
 
@@ -95,7 +96,7 @@ class Sampler:
         return state
 
     @torch.no_grad()
-    def sample_termial(self, size=1):
+    def sample_terminal(self, size=1):
         is_training = self.model.training
         self.model.eval()
         batch = BatchedState([self.initial_state() for _ in range(size)])
@@ -111,6 +112,8 @@ class Sampler:
                 sid = state_idx[i]
                 if new.state_type == StateType.Terminal:
                     done_state[sid] = new
+                elif new.num_nodes >= self.max_num_nodes:
+                    done_state[sid] = self.terminate(new)
                 else:
                     next_batch.append(new)
                     next_state_idx.append(sid)
@@ -134,7 +137,6 @@ class Sampler:
             node_order = input_state.node_order
 
         rank = np.argsort(node_order)  # order_index
-        e2t = dict(zip(input_state.edge_list, input_state.edge_type))
         input_adj = [
             sorted(input_state.adj[u], key=lambda x: rank[x])
             for u in range(input_state.num_nodes)
@@ -172,7 +174,7 @@ class Sampler:
                     action = Action(
                         ActionType.AddNode,
                         node_type=input_state.node_type[v],
-                        edge_type=e2t[(u, v)],
+                        edge_type=input_state.e2t[(u, v)],
                     )
                     state = self.step(state, action, copy=True)
                     traj.add_state_and_action(state, action)
@@ -186,7 +188,7 @@ class Sampler:
                 flg = False
                 for i in range(*state.target_range):
                     t = out2in[i]
-                    if (t, v) in e2t:
+                    if (t, v) in input_state.e2t:
                         flg = True
                         break
 
@@ -196,7 +198,7 @@ class Sampler:
                     action = Action(
                         ActionType.AddEdge,
                         target=target,
-                        edge_type=e2t[(t, v)],
+                        edge_type=input_state.e2t[(t, v)],
                     )
                     state = self.step(state, action, copy=True)
                     traj.add_state_and_action(state, action)
@@ -228,32 +230,34 @@ class Sampler:
 class ForwardActionDistribution:
     def __init__(
         self,
-        init_cat,
-        nodelv_cat,
-        edgelv_cat,
+        init_logits,
+        nodelv_logits,
+        edgelv_logits,
+        edgelv_index,
         num_edge_types,
         from_index,
     ):
-        self.init_cat = init_cat
-        self.nodelv_cat = nodelv_cat
-        self.edgelv_cat = edgelv_cat
+        self.init_cat = DefaultCategorical(logits=init_logits)
+        self.nodelv_cat = DefaultCategorical(logits=nodelv_logits)
+        self.edgelv_cat = VariadicCategorical(logits=edgelv_logits, indices=edgelv_index)
         self.num_edge_types = num_edge_types
 
         self._to_index = torch.argsort(from_index)
 
-        self.sizes = (self.init_cat.size, nodelv_cat.size, self.edgelv_cat.size)
+        self.sizes = (self.init_cat.size, self.nodelv_cat.size, self.edgelv_cat.size)
+        self.device = init_logits.device
 
     def _classify_actions_by_types(self, actions):
         init_actions = [a for a in actions if a.action_type == ActionType.First]
         nodelv_actions = [
             a
             for a in actions
-            if a.action_type in [ActionType.AddNode, ActionType.StopNode]
+            if a.action_type in {ActionType.AddNode, ActionType.StopNode}
         ]
         edgelv_actions = [
             a
             for a in actions
-            if a.action_type in [ActionType.AddEdge, ActionType.StopEdge]
+            if a.action_type in {ActionType.AddEdge, ActionType.StopEdge}
         ]
         return dict(
             init_actions=init_actions,
@@ -290,19 +294,19 @@ class ForwardActionDistribution:
         return self.edgelv_cat.log_prob(value)
 
     def init_actions_to_tensor(self, actions):
-        return torch.LongTensor([a.node_type for a in actions])
+        return torch.tensor([a.node_type for a in actions], dtype=torch.long, device=self.device)
 
     def init_tensor_to_actions(self, tensor):
         return [Action(ActionType.First, node_type=i.item()) for i in tensor]
 
     def nodelv_actions_to_tensor(self, actions):
-        return torch.LongTensor(
+        return torch.tensor(
             [
                 0
                 if a.action_type == ActionType.StopNode
                 else (1 + self.num_edge_types * a.node_type + a.edge_type)
                 for a in actions
-            ]
+            ], dtype=torch.long, device=self.device
         )
 
     def nodelv_tensor_to_actions(self, tensor):
@@ -323,13 +327,13 @@ class ForwardActionDistribution:
         return actions
 
     def edgelv_actions_to_tensor(self, actions):
-        return torch.LongTensor(
+        return torch.tensor(
             [
                 0
                 if a.action_type == ActionType.StopEdge
                 else (1 + self.num_edge_types * a.target + a.edge_type)
                 for a in actions
-            ]
+            ], dtype=torch.long, device=self.device
         )
 
     def edgelv_tensor_to_actions(self, tensor):
@@ -494,8 +498,13 @@ def _rank_values(indices):
     output: [1, 1, 2, 3, 3, 0]
     """
     u = indices.unique(sorted=True)
-    s = torch.arange(len(u))
-    mapping = torch.full((max(s, default=0) + 1,), -1, dtype=torch.long).scatter_(
+    s = torch.arange(len(u), device=indices.device)
+    mapping = torch.full(
+        (max(s, default=0) + 1,), 
+        -1, 
+        dtype=torch.long, 
+        device=indices.device
+    ).scatter_(
         dim=0, index=u, src=s
     )
     return mapping[indices]

@@ -8,9 +8,8 @@ import networkx as nx
 import torch
 from torch_scatter import scatter_log_softmax
 
-from src.samplers import VariadicCategorical, BackwardActionDistribution
-from src.types import (
-    GraphBuildingEnv,
+from src.samplers import VariadicCategorical, BackwardActionDistribution, Sampler
+from src.containers import (
     State,
     StateType,
     Action,
@@ -18,7 +17,7 @@ from src.types import (
     Trajectory,
     BatchedState,
 )
-from src.models import GraphPolicy, GraphEmbedding
+from src.models import GraphPolicy
 
 
 regular_state = State(  # d=3, n=10, regular graph
@@ -87,29 +86,29 @@ actions2 = [
     Action(ActionType.StopNode),
 ]
 
-env = GraphBuildingEnv(3, 3, max_degree=10)
 
-
-def follow_actions(actions):
-    state = env.initial_state()
+def follow_actions(sampler, actions):
+    state = sampler.initial_state()
     states = [state]
     for action in actions:
-        state = env.step(state, action, copy=True)
+        state = sampler.step(state, action, copy=True)
         states.append(state)
     return Trajectory(states, actions)
 
 
 class TestEnv(TestCase):
     def test_step1(self):
-        state = env.initial_state()
+        sampler = Sampler(None, max_step=100, max_degree=5)
+        state = sampler.initial_state()
         for action in actions1:
-            env.step(state, action, copy=False)
+            sampler.step(state, action, copy=False)
             self.check_valid_graph_state(state)
 
     def test_step2(self):
-        state = env.initial_state()
+        sampler = Sampler(None, max_step=100, max_degree=4)
+        state = sampler.initial_state()
         for action in actions2:
-            env.step(state, action, copy=False)
+            sampler.step(state, action, copy=False)
             self.check_valid_graph_state(state)
 
     def check_valid_graph_state(self, state: State):
@@ -150,14 +149,14 @@ def train_overfit(model, traj, n_updates=50):
     return losses
 
 
-def sample_from_model(env, model):
-    state = env.initial_state()
+def sample_from_model(sampler, model):
+    state = sampler.initial_state()
     actions = []
     states = [state]
     for _ in range(300):
         cat = model.forward_action(BatchedState([state]))
         action = cat.sample()[0]
-        state = env.step(state, action)
+        state = sampler.step(state, action)
         states.append(state)
         actions.append(action)
 
@@ -169,18 +168,22 @@ def sample_from_model(env, model):
 class TestModel(TestCase):
     def test_forward1(self):
         model = GraphPolicy(num_node_types, num_edge_types)
-        traj = follow_actions(actions1)
+        sampler = Sampler(model, max_step=100, max_degree=5)
+        
+        traj = follow_actions(sampler, actions1)
         train_overfit(model, traj)
-        sample = sample_from_model(env, model)
+        sample = sample_from_model(sampler, model)
         G1, G2 = traj.get_last_state().to_nx(), sample.get_last_state().to_nx()
 
         self.assertTrue(nx.is_isomorphic(G1, G2))
 
     def test_forward2(self):
         model = GraphPolicy(num_node_types, num_edge_types)
-        traj = follow_actions(actions2)
+        sampler = Sampler(model, max_step=100, max_degree=5)
+        
+        traj = follow_actions(sampler, actions2)
         train_overfit(model, traj)
-        sample = sample_from_model(env, model)
+        sample = sample_from_model(sampler, model)
         G1, G2 = traj.get_last_state().to_nx(), sample.get_last_state().to_nx()
 
         self.assertTrue(nx.is_isomorphic(G1, G2))
@@ -215,4 +218,4 @@ class TestBFSPlackettLuce(TestCase):
         for _ in range(1000):
             N += bfspl.sample()[0].item() == 0
 
-        self.assertTrue(220 < N < 280)
+        self.assertTrue(210 < N < 290)

@@ -6,7 +6,7 @@ import torch_geometric.nn as gnn
 import torch_geometric.data as gd
 from torch_scatter import scatter_add
 
-from src.types import StateType, BatchedState, BatchedTrajectory
+from src.containers import StateType, BatchedState, BatchedTrajectory
 from src.samplers import (
     ForwardActionDistribution,
     BackwardActionDistribution,
@@ -191,7 +191,7 @@ class GraphEmbedding(nn.Module):
         data_list = [s.to_tensor() for s in batch.sort_states()]
         graphs = gd.Batch.from_data_list(data_list)
         graphs.sptr = torch.cumsum(torch.LongTensor([0] + batch.size_by_type), dim=0)
-        return graphs
+        return graphs.to(self.device)
 
 
 class GraphPolicy(nn.Module):
@@ -230,7 +230,7 @@ class GraphPolicy(nn.Module):
         logits = self.mlp["backward"](g.emb["node_embeddings"]).flatten()
         node_sizes = g.ptr[1:] - g.ptr[:-1]
         adjacency_lists = batch.adjacency_lists()
-        multiplicity = batch.count_automorphisms()
+        multiplicity = batch.count_automorphisms().to(self.device)
         return BackwardActionDistribution(
             logits=logits,
             sizes=node_sizes,
@@ -251,7 +251,7 @@ class GraphPolicy(nn.Module):
         nodelv_logits = self.mlp["nodelv"](nodelv_glob)
         edgelv_logits = self.mlp["edgelv"](edgelv_glob, ne_emb)
 
-        edgelv_stop_index = torch.arange(k - j)
+        edgelv_stop_index = torch.arange(k - j, device=self.device)
         edgelv_tgt_index = torch.repeat_interleave(
             g.num_non_edges[j:k] * self.num_edge_types
         )
@@ -262,9 +262,10 @@ class GraphPolicy(nn.Module):
         edgelv_cat = VariadicCategorical(logits=edgelv_logits, indices=edgelv_index)
 
         return ForwardActionDistribution(
-            init_cat,
-            nodelv_cat,
-            edgelv_cat,
+            init_logits,
+            nodelv_logits,
+            edgelv_logits,
+            edgelv_index,
             self.num_edge_types,
             batch.sort_indices(),
         )
@@ -272,7 +273,7 @@ class GraphPolicy(nn.Module):
     def loss(self, traj: BatchedTrajectory, logR: torch.Tensor):  # logZ
         fwd_act = self.forward_action(traj.get_states())
         log_pf_s = fwd_act.log_prob(traj.get_actions())
-        t_idx = torch.repeat_interleave(traj.get_length())
+        t_idx = torch.repeat_interleave(traj.get_length().to(self.device))
         log_pf = scatter_add(log_pf_s, t_idx)
 
         last_state = traj.get_last_state()

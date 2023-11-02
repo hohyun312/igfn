@@ -72,7 +72,12 @@ class State:
     target_range: Optional[tuple[int, int]] = None
 
     adj: list[list[int]] = field(default_factory=list)
+    e2t: dict[tuple, int] = field(default_factory=dict)
 
+    def __post_init__(self):
+        self.build_adjacency_list()
+        self.build_edge_to_type()
+        
     @property
     def num_nodes(self):
         return len(self.node_type)
@@ -97,6 +102,8 @@ class State:
         self.edge_type.extend([edge_type, edge_type])
         self.adj[v].append(u)
         self.adj[u].append(v)
+        self.e2t[(u, v)] = edge_type
+        self.e2t[(v, u)] = edge_type
 
     def queue(self):
         """
@@ -119,6 +126,10 @@ class State:
         for u, v in self.edge_list:
             neighbor[u].append(v)
         self.adj = neighbor
+        return self
+
+    def build_edge_to_type(self):
+        self.e2t = dict(zip(self.edge_list, self.edge_type))
         return self
 
     def get_neighboring_edge_attr(self):
@@ -227,7 +238,7 @@ class State:
         edge_list = [e for u, v, _ in edges for e in [(u, v), (v, u)]]
         return cls(
             StateType.Terminal, node_type, edge_type, edge_list
-        ).build_adjacency_list()
+        )
 
     def visualize(self, figsize=(3, 3), node_color="node_type", bfs_root=None, **kargs):
         def bfs_order(neighbors, root=0):
@@ -423,58 +434,3 @@ class BatchedTrajectory:
 
     def __repr__(self):
         return f"{self.__class__.__name__}(sizes: {[len(t) for t in self.data]})"
-
-
-class MolGraph(State):
-    id2atom = ["C", "N", "O", "S", "P", "F", "I", "Cl", "Br"]
-    id2bond = [BondType.SINGLE, BondType.DOUBLE, BondType.TRIPLE]  # BondType.AROMATIC
-
-    bond2id = {BondType.SINGLE: 0, BondType.DOUBLE: 1, BondType.TRIPLE: 2}
-    atom2id = {"C": 0, "N": 1, "O": 2, "S": 3, "P": 4, "F": 5, "I": 6, "Cl": 7, "Br": 8}
-
-    num_edge_types = len(bond2id)
-    num_node_types = len(atom2id)
-
-    @classmethod
-    def from_molecule(cls, molecule):
-        Chem.SanitizeMol(molecule, sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
-        node_type = cls.get_node_type(molecule)
-        edge_list, edge_type = cls.get_edge_list_and_type(molecule)
-        return cls(StateType.Terminal, node_type, edge_type, edge_list)
-
-    def to_molecule(self):
-        mol = Chem.RWMol()
-        for t in self.node_type:
-            atom_symbol = self.id2atom[t]
-            mol.AddAtom(Chem.Atom(atom_symbol))
-
-        # remove duplicate edges
-        edge_list, edge_type = self.edge_list[::2], self.edge_type[::2]
-        for (i, j), t in zip(edge_list, edge_type):
-            mol.AddBond(i, j, order=self.id2bond[t])
-        return mol
-
-    @classmethod
-    def from_smiles(cls, smiles):
-        molecule = Chem.MolFromSmiles(smiles)
-        return cls.from_molecule(molecule)
-
-    @classmethod
-    def get_node_type(cls, molecule):
-        node_type = []
-        for i in range(molecule.GetNumAtoms()):
-            atom = molecule.GetAtomWithIdx(i)
-            node_type.append(cls.atom2id[atom.GetSymbol()])
-        return node_type
-
-    @classmethod
-    def get_edge_list_and_type(cls, molecule):
-        edge_list = []
-        edge_type = []
-        for i in range(molecule.GetNumBonds()):
-            bond = molecule.GetBondWithIdx(i)
-            t = cls.bond2id[bond.GetBondType()]
-            u, v = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-            edge_list += [(u, v), (v, u)]
-            edge_type += [t, t]
-        return edge_list, edge_type

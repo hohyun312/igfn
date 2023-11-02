@@ -1,7 +1,7 @@
 import numpy as np
 import networkx as nx
 from copy import deepcopy
-from src.types import BatchedState, State
+from src.containers import BatchedState, State
 
 
 def grid_graph(size=1):
